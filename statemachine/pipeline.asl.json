@@ -1,0 +1,203 @@
+{
+  "Comment": "PoC flow-credi: pipeline de documentos. Extract -> Identify(sync) -> RouteAfterIdentify -> (Parallel | OrganizeSolo | ValidateSolo[waitForTaskToken/AgentCore]) -> PipelineCompleted. Catch global -> PipelineFailed.",
+  "StartAt": "Extract",
+  "States": {
+    "Extract": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "OCR/extracao (Lambda simula 2s + logs estruturados)",
+      "Parameters": {
+        "FunctionName": "${ExtractFunctionArn}",
+        "Payload.$": "$"
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "Identify"
+    },
+
+    "Identify": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "Classifica o documento e decide as flags de roteamento (Lambda sincrona, sleep 2s). Nao chama o agente.",
+      "Parameters": {
+        "FunctionName": "${IdentifyFunctionArn}",
+        "Payload.$": "$"
+      },
+      "OutputPath": "$.Payload",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "RouteAfterIdentify"
+    },
+
+    "RouteAfterIdentify": {
+      "Type": "Choice",
+      "Comment": "Roteia conforme as flags retornadas pelo agente",
+      "Choices": [
+        {
+          "And": [
+            { "Variable": "$.identify.shouldOrganize", "BooleanEquals": true },
+            { "Variable": "$.identify.shouldValidate", "BooleanEquals": true }
+          ],
+          "Next": "OrganizeAndValidateParallel"
+        },
+        {
+          "Variable": "$.identify.shouldOrganize",
+          "BooleanEquals": true,
+          "Next": "OrganizeSolo"
+        },
+        {
+          "Variable": "$.identify.shouldValidate",
+          "BooleanEquals": true,
+          "Next": "ValidateSolo"
+        }
+      ],
+      "Default": "PipelineCompleted"
+    },
+
+    "OrganizeAndValidateParallel": {
+      "Type": "Parallel",
+      "Comment": "Organize + Validate em paralelo (ambas flags true)",
+      "ResultPath": "$.parallelResult",
+      "Branches": [
+        {
+          "StartAt": "Organize",
+          "States": {
+            "Organize": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${OrganizeFunctionArn}",
+                "Payload.$": "$"
+              },
+              "OutputPath": "$.Payload",
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "ValidateDispatch",
+          "States": {
+            "ValidateDispatch": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+              "Comment": "ETAPA ANTES DO AGENTE (branch Validate, ao lado do Organize). Dispara o agente (validate_dispatcher) passando o taskToken e RETORNA na hora — a Lambda morre em ~1-4s. Este branch do Parallel DORME (sem custo) ate o agente chamar SendTaskSuccess (~15s). Nenhuma Lambda fica viva durante esse periodo.",
+              "Parameters": {
+                "FunctionName": "${ValidateDispatcherFunctionArn}",
+                "Payload": {
+                  "taskToken.$": "$$.Task.Token",
+                  "document.$": "$.document",
+                  "extractedText.$": "$.extract.extractedText",
+                  "executionId.$": "$$.Execution.Id"
+                }
+              },
+              "TimeoutSeconds": 120,
+              "HeartbeatSeconds": 60,
+              "ResultPath": "$.validation",
+              "Next": "AgentCoreValidacao"
+            },
+            "AgentCoreValidacao": {
+              "Type": "Pass",
+              "Comment": "VISUAL: representa o processamento do Bedrock AgentCore (~15s). Enquanto este 'no' esta ativo, o ValidateDispatch ja terminou (waitForTaskToken) e nenhuma Lambda esta viva — o agente valida o documento e acorda o fluxo via SendTaskSuccess. Pass state nao adiciona custo nem altera os dados.",
+              "Next": "ValidateResult"
+            },
+            "ValidateResult": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Comment": "ETAPA DEPOIS DO AGENTE. Roda quando o branch ACORDA (apos o callback). Uma NOVA Lambda processa o veredito devolvido pelo agente. Prova logica antes e depois, sem manter Lambda viva durante o processamento do agente.",
+              "Parameters": {
+                "FunctionName": "${ValidateResultFunctionArn}",
+                "Payload.$": "$"
+              },
+              "OutputPath": "$.Payload",
+              "End": true
+            }
+          }
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "PipelineCompleted"
+    },
+
+    "OrganizeSolo": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${OrganizeFunctionArn}",
+        "Payload.$": "$"
+      },
+      "OutputPath": "$.Payload",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "PipelineCompleted"
+    },
+
+    "ValidateSolo": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "Validacao 'leve' quando so shouldValidate=true (sem organizar). Lambda simples (sleep 2s). A validacao via agente acontece no branch Validate do Parallel.",
+      "Parameters": {
+        "FunctionName": "${ValidateFunctionArn}",
+        "Payload.$": "$"
+      },
+      "OutputPath": "$.Payload",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "PipelineCompleted"
+    },
+
+    "PipelineCompleted": {
+      "Type": "Succeed",
+      "Comment": "Fluxo concluido com sucesso"
+    },
+
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Comment": "Falha em alguma etapa do pipeline",
+      "Error": "PipelineError",
+      "CausePath": "States.JsonToString($.error)"
+    }
+  }
+}

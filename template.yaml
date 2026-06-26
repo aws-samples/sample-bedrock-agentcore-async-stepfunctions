@@ -1,0 +1,298 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  PoC flow-credi — Pipeline de analise de documentos assincrono.
+  Step Functions (Standard) usa o padrao waitForTaskToken para acordar
+  somente quando o agente do Bedrock AgentCore terminar (~15s), sem manter
+  Lambda bloqueada. Observabilidade completa via X-Ray + logs estruturados.
+
+Parameters:
+  AgentRuntimeArn:
+    Type: String
+    Description: >
+      ARN do Bedrock AgentCore Runtime ja deployado (via `agentcore deploy`).
+      Ex: arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/sup-agent-XXXX
+    Default: ""
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [arm64]
+    MemorySize: 256
+    Timeout: 30
+    # Observabilidade: X-Ray ativo em todas as Lambdas
+    Tracing: Active
+    Environment:
+      Variables:
+        LOG_LEVEL: !Ref LogLevel
+        SIMULATED_WORK_SECONDS: "2"
+
+Resources:
+
+  # =========================================================================
+  # Lambdas do pipeline (sleep 2s + logs estruturados nas etapas iniciais)
+  # =========================================================================
+
+  ExtractFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: flow-credi-extract
+      CodeUri: functions/extract/
+      Handler: index.handler
+      Description: OCR/extracao do documento (simula 2s de trabalho)
+      Policies:
+        - Statement:
+            - Sid: TextractRead
+              Effect: Allow
+              Action:
+                - textract:DetectDocumentText
+                - textract:AnalyzeDocument
+              Resource: "*"
+
+  IdentifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: flow-credi-identify
+      CodeUri: functions/identify/
+      Handler: index.handler
+      Description: >
+        Classifica o documento e decide as flags de roteamento (sincrona,
+        simula 2s). NAO chama o agente — a analise pesada fica no Validate.
+
+  ValidateDispatcherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: flow-credi-validate-dispatcher
+      CodeUri: functions/validate_dispatcher/
+      Handler: index.handler
+      Description: >
+        Recebe o taskToken do Step Functions, invoca o AgentCore Runtime
+        (assincrono) para VALIDAR o documento e RETORNA na hora (nao bloqueia).
+      Timeout: 15
+      Environment:
+        Variables:
+          AGENT_RUNTIME_ARN: !Ref AgentRuntimeArn
+      Policies:
+        - Statement:
+            - Sid: InvokeAgentCore
+              Effect: Allow
+              Action:
+                - bedrock-agentcore:InvokeAgentRuntime
+              Resource: "*"
+    Metadata:
+      # Empacota o @aws-sdk/client-bedrock-agentcore (nao incluso no runtime).
+      BuildMethod: esbuild
+      BuildProperties:
+        Format: esm
+        Target: node22
+        Minify: false
+        OutExtension:
+          - .js=.mjs
+        # Define require/__dirname num bundle ESM (deps CJS do SDK usam require)
+        Banner:
+          - js=import { createRequire } from 'module';const require = createRequire(import.meta.url);
+        EntryPoints:
+          - index.mjs
+
+  ValidateResultFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: flow-credi-validate-result
+      CodeUri: functions/validate_result/
+      Handler: index.handler
+      Description: >
+        Etapa DEPOIS do agente. Roda quando o Step Functions acorda; processa o
+        veredito devolvido pelo AgentCore (simula 2s). Prova a logica pos-agente.
+
+  OrganizeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: flow-credi-organize
+      CodeUri: functions/organize/
+      Handler: index.handler
+      Description: Organiza o documento analisado (simula 2s de trabalho)
+
+  ValidateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: flow-credi-validate
+      CodeUri: functions/validate/
+      Handler: index.handler
+      Description: >
+        Validacao "leve" usada dentro do Parallel (simula 2s). A validacao via
+        agente (assincrona) acontece no estado ValidateSolo.
+
+  # =========================================================================
+  # State Machine (Standard — necessario p/ waitForTaskToken)
+  # =========================================================================
+
+  DocumentPipeline:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: flow-credi-document-pipeline
+      Type: STANDARD
+      DefinitionUri: statemachine/pipeline.asl.json
+      DefinitionSubstitutions:
+        ExtractFunctionArn: !GetAtt ExtractFunction.Arn
+        IdentifyFunctionArn: !GetAtt IdentifyFunction.Arn
+        ValidateDispatcherFunctionArn: !GetAtt ValidateDispatcherFunction.Arn
+        ValidateResultFunctionArn: !GetAtt ValidateResultFunction.Arn
+        OrganizeFunctionArn: !GetAtt OrganizeFunction.Arn
+        ValidateFunctionArn: !GetAtt ValidateFunction.Arn
+      Tracing:
+        Enabled: true   # X-Ray na state machine
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt PipelineLogGroup.Arn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ExtractFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref IdentifyFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ValidateDispatcherFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ValidateResultFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref OrganizeFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ValidateFunction
+        - Statement:
+            - Sid: XRayTracing
+              Effect: Allow
+              Action:
+                - xray:PutTraceSegments
+                - xray:PutTelemetryRecords
+                - xray:GetSamplingRules
+                - xray:GetSamplingTargets
+              Resource: "*"
+        - Statement:
+            - Sid: CloudWatchLogsForSfn
+              Effect: Allow
+              Action:
+                - logs:CreateLogDelivery
+                - logs:GetLogDelivery
+                - logs:UpdateLogDelivery
+                - logs:DeleteLogDelivery
+                - logs:ListLogDeliveries
+                - logs:PutResourcePolicy
+                - logs:DescribeResourcePolicies
+                - logs:DescribeLogGroups
+              Resource: "*"
+
+  PipelineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/vendedlogs/states/flow-credi-document-pipeline
+      RetentionInDays: 14
+
+  # =========================================================================
+  # State Machine 2 (DIRETO): chama o AgentCore SEM Lambda dispatcher,
+  # via SDK integration (invokeAgentRuntime, request-response sincrono).
+  # Serve para comparar lado a lado com a versao waitForTaskToken + Lambda.
+  # =========================================================================
+
+  DocumentPipelineDirect:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: flow-credi-pipeline-direct
+      Type: STANDARD
+      DefinitionUri: statemachine/pipeline-direct.asl.json
+      DefinitionSubstitutions:
+        ExtractFunctionArn: !GetAtt ExtractFunction.Arn
+        IdentifyFunctionArn: !GetAtt IdentifyFunction.Arn
+        AgentRuntimeArn: !Ref AgentRuntimeArn
+      Tracing:
+        Enabled: true
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt PipelineDirectLogGroup.Arn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ExtractFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref IdentifyFunction
+        - Statement:
+            - Sid: InvokeAgentCoreDirect
+              Effect: Allow
+              Action:
+                - bedrock-agentcore:InvokeAgentRuntime
+              Resource: "*"
+        - Statement:
+            - Sid: XRayTracing
+              Effect: Allow
+              Action:
+                - xray:PutTraceSegments
+                - xray:PutTelemetryRecords
+                - xray:GetSamplingRules
+                - xray:GetSamplingTargets
+              Resource: "*"
+        - Statement:
+            - Sid: CloudWatchLogsForSfn
+              Effect: Allow
+              Action:
+                - logs:CreateLogDelivery
+                - logs:GetLogDelivery
+                - logs:UpdateLogDelivery
+                - logs:DeleteLogDelivery
+                - logs:ListLogDeliveries
+                - logs:PutResourcePolicy
+                - logs:DescribeResourcePolicies
+                - logs:DescribeLogGroups
+              Resource: "*"
+
+  PipelineDirectLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/vendedlogs/states/flow-credi-pipeline-direct
+      RetentionInDays: 14
+
+  # =========================================================================
+  # Permissao p/ o AgentCore acordar o Step Functions (SendTaskSuccess/Failure)
+  # Role assumida pelo runtime do AgentCore — ARN exportado para uso no deploy.
+  # =========================================================================
+
+  AgentCallbackPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: flow-credi-agent-callback
+      Description: Permite ao agente acordar o Step Functions via task token
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: SendTaskCallback
+            Effect: Allow
+            Action:
+              - states:SendTaskSuccess
+              - states:SendTaskFailure
+              - states:SendTaskHeartbeat
+            Resource: !Ref DocumentPipeline
+
+Outputs:
+  StateMachineArn:
+    Description: ARN da state machine do pipeline (com Lambda + waitForTaskToken)
+    Value: !Ref DocumentPipeline
+
+  StateMachineDirectArn:
+    Description: ARN da state machine DIRETA (AgentCore sem Lambda, SDK integration)
+    Value: !Ref DocumentPipelineDirect
+
+  AgentCallbackPolicyArn:
+    Description: >
+      Anexe esta managed policy a execution role do AgentCore Runtime
+      para ele poder chamar SendTaskSuccess/SendTaskFailure.
+    Value: !Ref AgentCallbackPolicy
+
+  ValidateDispatcherFunctionName:
+    Value: !Ref ValidateDispatcherFunction

@@ -1,0 +1,10 @@
+{
+  "name": "flow-credi-validate-dispatcher",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Dispatcher que invoca o Bedrock AgentCore (async) passando o taskToken",
+  "dependencies": {
+    "@aws-sdk/client-bedrock-agentcore": "^3.1075.0",
+    "esbuild": "^0.28.1"
+  }
+}

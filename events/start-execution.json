@@ -1,0 +1,7 @@
+{
+  "document": {
+    "key": "documentos/matricula-12345.pdf",
+    "bucket": "exemplo-flow-credi",
+    "tipo": "matricula"
+  }
+}

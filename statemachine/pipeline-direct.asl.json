@@ -1,0 +1,86 @@
+{
+  "Comment": "PoC flow-credi (DIRETO): demonstra a chamada do Bedrock AgentCore DIRETO do Step Functions, via SDK integration (invokeAgentRuntime), SEM Lambda dispatcher. Extract -> Identify -> ValidateDireto (AgentCore) -> PipelineCompleted.",
+  "StartAt": "Extract",
+  "States": {
+    "Extract": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "OCR/extracao (Lambda simula 2s)",
+      "Parameters": {
+        "FunctionName": "${ExtractFunctionArn}",
+        "Payload.$": "$"
+      },
+      "OutputPath": "$.Payload",
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "PipelineFailed" }
+      ],
+      "Next": "Identify"
+    },
+
+    "Identify": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "Classifica o documento (Lambda sincrona, sleep 2s).",
+      "Parameters": {
+        "FunctionName": "${IdentifyFunctionArn}",
+        "Payload.$": "$"
+      },
+      "OutputPath": "$.Payload",
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "PipelineFailed" }
+      ],
+      "Next": "ValidateDireto"
+    },
+
+    "ValidateDireto": {
+      "Type": "Task",
+      "Comment": "CHAMADA DIRETA AO AGENTCORE — sem Lambda. SDK integration invokeAgentRuntime (request-response sincrono). O Step Functions fica esperando o agente responder (~15s) e recebe o veredito direto no resultado. Compare com a versao com Lambda dispatcher + waitForTaskToken.",
+      "Resource": "arn:aws:states:::aws-sdk:bedrockagentcore:invokeAgentRuntime",
+      "Parameters": {
+        "AgentRuntimeArn": "${AgentRuntimeArn}",
+        "RuntimeSessionId.$": "States.Hash($$.Execution.Id, 'SHA-256')",
+        "Payload.$": "States.JsonToString($)"
+      },
+      "ResultSelector": {
+        "raw.$": "$.Response"
+      },
+      "ResultPath": "$.agentRaw",
+      "TimeoutSeconds": 120,
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "PipelineFailed" }
+      ],
+      "Next": "ParseAgentResponse"
+    },
+
+    "ParseAgentResponse": {
+      "Type": "Pass",
+      "Comment": "O Response vem como string JSON (ex.: {\"validation\": {...}}); converte em objeto e expoe o veredito em $.validation.",
+      "Parameters": {
+        "parsed.$": "States.StringToJson($.agentRaw.raw)"
+      },
+      "ResultPath": "$.agentParsed",
+      "Next": "ExtrairVeredito"
+    },
+
+    "ExtrairVeredito": {
+      "Type": "Pass",
+      "Comment": "Promove o veredito do agente para $.validation (mesma forma da versao com Lambda).",
+      "Parameters": {
+        "validation.$": "$.agentParsed.parsed.validation"
+      },
+      "ResultPath": "$.resultado",
+      "Next": "PipelineCompleted"
+    },
+
+    "PipelineCompleted": {
+      "Type": "Succeed",
+      "Comment": "Fluxo (direto) concluido com sucesso"
+    },
+
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Error": "PipelineError",
+      "CausePath": "States.JsonToString($.error)"
+    }
+  }
+}

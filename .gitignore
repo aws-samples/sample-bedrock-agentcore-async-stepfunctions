@@ -1,0 +1,36 @@
+# --- Build / deps ---
+.aws-sam/
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+dist/
+build/
+
+# --- AgentCore state local (gerado por `agentcore configure/deploy`) ---
+agentcore/.bedrock_agentcore.yaml
+agentcore/.bedrock_agentcore/
+agentcore/Dockerfile.bak
+
+# --- Config local / segredos ---
+.env
+*.local
+samconfig.local.toml
+
+# --- Material especifico de cliente / nao versionar ---
+email-cliente.md
+email-cliente.docx
+IMG_0106.jpeg
+*.jpeg
+*.jpg
+diagram_rot.jpeg
+sup-escritorio.json
+transcricao-dialogo.md
+descricao-reuniao.md
+DEPLOY-RESULTADO.md
+poc-plano-implementacao.md
+
+# --- SO ---
+.DS_Store
+*.swp
