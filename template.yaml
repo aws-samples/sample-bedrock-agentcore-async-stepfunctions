@@ -74,7 +74,9 @@ Resources:
         Receives the taskToken from Step Functions, invokes the AgentCore
         Runtime (asynchronously) to VALIDATE the document and RETURNS
         immediately (does not block).
-      Timeout: 15
+      # 256 MB (Globals) + 30s are usually sufficient for the dispatcher: it only
+      # fires the agent and returns; the ~15s of work happens with no Lambda alive.
+      Timeout: 30
       Environment:
         Variables:
           AGENT_RUNTIME_ARN: !Ref AgentRuntimeArn
@@ -127,6 +129,66 @@ Resources:
       Description: >
         "Light" validation used inside the Parallel (simulates 2s). Agent-based
         (asynchronous) validation happens in the ValidateSolo state.
+
+  # =========================================================================
+  # Pattern 3 — Lambda durable function (orchestration-as-code)
+  # Replaces Step Functions: the whole pipeline is expressed in code with the
+  # AWS Durable Execution SDK. The agent wait is context.waitForCallback; the
+  # agent resumes it via SendDurableExecutionCallbackSuccess.
+  # Durable functions must be invoked through a qualified identifier
+  # (version/alias) — AutoPublishAlias provides one.
+  # =========================================================================
+
+  DurablePipelineFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: doc-pipeline-durable
+      CodeUri: functions/durable_pipeline/
+      Handler: index.handler
+      Description: >
+        Durable function that orchestrates Extract -> Identify -> (Organize +
+        Validate) -> Result as code, waiting for the AgentCore agent via a
+        durable callback (no compute charge during the wait).
+      Timeout: 60
+      AutoPublishAlias: live
+      # Enables durable execution (checkpoint/replay). Create-only property —
+      # a function cannot be converted to durable after creation.
+      DurableConfig:
+        ExecutionTimeout: 900
+        RetentionPeriodInDays: 7
+      Environment:
+        Variables:
+          AGENT_RUNTIME_ARN: !Ref AgentRuntimeArn
+      Policies:
+        - Statement:
+            - Sid: InvokeAgentCore
+              Effect: Allow
+              Action:
+                - bedrock-agentcore:InvokeAgentRuntime
+              Resource: "*"
+        - Statement:
+            # Required for the durable execution checkpoint/replay mechanism.
+            - Sid: DurableExecutionCheckpoint
+              Effect: Allow
+              Action:
+                - lambda:CheckpointDurableExecution
+                - lambda:GetDurableExecutionState
+              Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:doc-pipeline-durable:*"
+    Metadata:
+      # Bundles @aws/durable-execution-sdk-js + the AgentCore client.
+      BuildMethod: esbuild
+      BuildProperties:
+        Format: esm
+        Target: node22
+        Minify: false
+        OutExtension:
+          - .js=.mjs
+        # Import createRequire under an alias: the durable SDK bundle already
+        # declares `createRequire`, so a plain import would collide.
+        Banner:
+          - js=import { createRequire as __cr } from 'module';const require = __cr(import.meta.url);
+        EntryPoints:
+          - index.mjs
 
   # =========================================================================
   # State Machine (Standard — required for waitForTaskToken)
@@ -268,7 +330,7 @@ Resources:
     Type: AWS::IAM::ManagedPolicy
     Properties:
       ManagedPolicyName: doc-pipeline-agent-callback
-      Description: Allows the agent to wake up Step Functions via task token
+      Description: Allows the agent to resume Step Functions (task token) or the durable function (callback)
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -279,6 +341,13 @@ Resources:
               - states:SendTaskFailure
               - states:SendTaskHeartbeat
             Resource: !Ref DocumentPipeline
+          - Sid: SendDurableCallback
+            Effect: Allow
+            Action:
+              - lambda:SendDurableExecutionCallbackSuccess
+              - lambda:SendDurableExecutionCallbackFailure
+              - lambda:SendDurableExecutionCallbackHeartbeat
+            Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:doc-pipeline-durable:*"
 
 Outputs:
   StateMachineArn:
@@ -288,6 +357,17 @@ Outputs:
   StateMachineDirectArn:
     Description: ARN of the DIRECT state machine (AgentCore without Lambda, SDK integration)
     Value: !Ref DocumentPipelineDirect
+
+  DurablePipelineFunctionName:
+    Description: >
+      Name of the Pattern 3 durable function. Invoke it through the "live"
+      qualifier, e.g. aws lambda invoke --function-name doc-pipeline-durable
+      --qualifier live --invocation-type Event ...
+    Value: !Ref DurablePipelineFunction
+
+  DurablePipelineAliasArn:
+    Description: Qualified ARN (alias) of the durable function — required to invoke it
+    Value: !Ref DurablePipelineFunction.Alias
 
   AgentCallbackPolicyArn:
     Description: >

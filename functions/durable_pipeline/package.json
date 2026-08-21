@@ -1,0 +1,11 @@
+{
+  "name": "doc-pipeline-durable",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Pattern 3 — Lambda durable function orchestrating the document pipeline as code",
+  "dependencies": {
+    "@aws/durable-execution-sdk-js": "^2.3.0",
+    "@aws-sdk/client-bedrock-agentcore": "^3.1075.0",
+    "esbuild": "^0.28.1"
+  }
+}

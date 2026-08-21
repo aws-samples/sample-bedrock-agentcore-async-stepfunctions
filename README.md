@@ -4,17 +4,19 @@
 > **Bedrock AgentCore** agent (~15s of processing) inside a **Step Functions**
 > pipeline, showing how to **not waste Lambda cost** while the agent works.
 
-Demonstrates, with infrastructure as code (AWS SAM), **two strategies** for
-integrating a Bedrock AgentCore agent into a Step Functions pipeline without
-keeping a Lambda blocked during the agent's processing.
+Demonstrates, with infrastructure as code (AWS SAM), **three strategies** for
+integrating a Bedrock AgentCore agent into a serverless pipeline without keeping
+a Lambda blocked during the agent's processing — two orchestrated with Step
+Functions and one with a Lambda durable function.
 
-The project deploys **two state machines** that do the same thing via different
-paths, so you can compare them side by side:
+The project deploys **three orchestrations** that do the same thing via
+different paths, so you can compare them side by side:
 
-| Strategy | State machine | How it calls AgentCore |
+| Strategy | Orchestrator | How it calls AgentCore |
 |---|---|---|
-| **A — with Lambda** | `doc-pipeline` | Lambda dispatcher + `lambda:invoke.waitForTaskToken` (asynchronous) |
-| **B — direct** | `doc-pipeline-direct` | `aws-sdk:bedrockagentcore:invokeAgentRuntime` — **no Lambda** (synchronous) |
+| **A — with Lambda** | Step Functions `doc-pipeline` | Lambda dispatcher + `lambda:invoke.waitForTaskToken` (asynchronous) |
+| **B — direct** | Step Functions `doc-pipeline-direct` | `aws-sdk:bedrockagentcore:invokeAgentRuntime` — **no Lambda** (synchronous) |
+| **C — durable function** | Lambda `doc-pipeline-durable` | `context.waitForCallback` + `SendDurableExecutionCallbackSuccess` (asynchronous, orchestration-as-code) |
 
 ---
 
@@ -37,7 +39,7 @@ StartExecution
     │     │                    │   │   → invokes AgentCore and RETURNS (dies ~5s)│
     │     │                    │   │   → the branch SLEEPS at no cost           │
     │     │                    │   │        ▼ (AgentCore validates ~15-25s)     │
-    │     │                    │   │   SendTaskSuccess ← tool complete_validation│
+    │     │                    │   │   SendTaskSuccess ← tool conclude_validation│
     │     │                    │   │ AgentCoreValidation (Pass, visual marker)  │
     │     │                    │   │ ValidateResult    (Lambda) processes verdict│
     │     └────────────────────┘   └─────────────────────────────────────────────┘
@@ -49,7 +51,7 @@ StartExecution
 
 - The agent runs in **asynchronous** mode (`@app.async_task`): the entrypoint
   returns right away and the ~15s of work happens in the background; when it
-  finishes, the `complete_validation` tool calls `SendTaskSuccess(taskToken)`
+  finishes, the `conclude_validation` tool calls `SendTaskSuccess(taskToken)`
   and **wakes up** Step Functions.
 - The `ValidateDispatch` Lambda only forwards the token and dies — it **does not
   wait for the agent**.
@@ -73,14 +75,13 @@ StartExecution
    ValidateDirect  Task  →  arn:aws:states:::aws-sdk:bedrockagentcore:invokeAgentRuntime
                             (request-response: the SFN waits for the agent ~15-25s
                              and receives the verdict DIRECTLY in the step result)
-   ParseAgentResponse  (Pass: Response string → JSON)
-   ExtractVerdict      (Pass: exposes $.validation)
+   ParseVerdict        (Pass: Response string → JSON verdict)
    PipelineCompleted
 ```
 
-- The agent runs in **synchronous** mode (no `taskToken`): it validates and
-  **returns the verdict in the payload itself**. The same runtime serves both
-  modes — it decides based on the presence or absence of `taskToken` in the event.
+- The agent runs in **synchronous** mode (no `taskToken`, no `callbackId`): it
+  validates and **returns the verdict in the payload itself**. The same runtime
+  serves all modes — it decides based on which fields are present in the event.
 - **No Lambda, zero glue code.** Simpler to read in the Graph view.
 
 **When to use:** the agent responds quickly (the synchronous call has a ~15 min
@@ -89,20 +90,60 @@ the agent responds.
 
 ---
 
-## Lambda vs Direct — comparison
+## Strategy C — Lambda durable function (asynchronous, orchestration-as-code)
 
-| | A — Lambda + waitForTaskToken | B — Direct (SDK integration) |
-|---|---|---|
-| Lambda in the agent path | yes (dispatcher), but **dies early** | **none** |
-| Agent mode | asynchronous (callback) | synchronous (response in payload) |
-| Cost during processing | **zero** (SFN sleeping) | pays for the *step* time (Standard bills per transition, not per wait; the real cost is AgentCore) |
-| Duration limit | up to 8h (agent) | ~15 min (synchronous call) |
-| Complexity | higher (Lambda + IAM callback + token) | minimal (1 Task state) |
-| Logic before/after the agent | explicit (`ValidateDispatch`/`ValidateResult`) | in the Pass states / other steps |
+Instead of a state machine, the whole pipeline is expressed as ordinary code in
+a single Lambda **durable function** (AWS Durable Execution SDK). Stages become
+`context.step`, the Organize + Validate fan-out becomes `context.parallel`, and
+the wait for the agent becomes `context.waitForCallback` — the execution
+suspends with **no compute charge** until the agent resumes it.
+
+```
+aws lambda invoke (async, qualified) : doc-pipeline-durable
+   │
+   ▼ Lambda durable function (@aws/durable-execution-sdk-js)
+   context.step("extract")     OCR (simulated 2s)
+   context.step("identify")    decides flags
+   context.parallel("organize-and-validate")
+     ├─ context.step("organize")
+     └─ context.waitForCallback("validate-agentcore", dispatchAgentCore, {timeout:120s})
+            → invokes AgentCore (async) passing a durable callbackId
+            → the execution SLEEPS at no cost (no Lambda running)
+                 ▼ (AgentCore validates ~15-25s)
+            SendDurableExecutionCallbackSuccess ← tool conclude_validation
+   context.step("result")      processes the verdict
+```
+
+- The agent runs **asynchronously**: the entrypoint returns "accepted" and,
+  when finished, the `conclude_validation` tool calls
+  `SendDurableExecutionCallbackSuccess(CallbackId, Result)` to **resume** the
+  durable execution.
+- **No Step Functions, no glue Lambdas** — orchestration and business logic live
+  together as code. Durable functions must be invoked through a **qualified
+  identifier** (version/alias) — the stack publishes a `live` alias.
+
+**When to use:** you prefer expressing orchestration as code in one place
+instead of a state machine, want zero cost during the wait, and are comfortable
+with orchestration living inside Lambda (up to 1 year of durable execution).
+
+---
+
+## Comparison
+
+| | A — Lambda + waitForTaskToken | B — Direct (SDK integration) | C — Durable function |
+|---|---|---|---|
+| Orchestrator | Step Functions | Step Functions | Lambda (code) |
+| Lambda in the agent path | yes (dispatcher), but **dies early** | **none** | the durable function itself (**suspended**, no charge) |
+| Agent mode | asynchronous (task token) | synchronous (response in payload) | asynchronous (durable callback) |
+| Cost during processing | **zero** (SFN sleeping) | pays for the *step* time (real cost is AgentCore) | **zero** (execution suspended) |
+| Duration limit | up to 8h (agent) | ~15 min (synchronous call) | up to 1 year (durable execution) |
+| Complexity | higher (Lambda + IAM callback + token) | minimal (1 Task state) | medium (orchestration-as-code + callback IAM) |
+| Logic before/after the agent | explicit (`ValidateDispatch`/`ValidateResult`) | in the Pass states / other steps | plain `context.step` calls |
 
 > **Summary:** for quick validations, **B (direct)** is simpler. For long-running
-> or multi-agent processes, **A (Lambda + waitForTaskToken)** guarantees zero
-> cost during the wait.
+> or multi-agent processes, **A (waitForTaskToken)** and **C (durable function)**
+> both guarantee zero cost during the wait — choose A/B if you want Step
+> Functions orchestration, or C if you prefer orchestration-as-code in Lambda.
 
 ---
 
@@ -120,31 +161,44 @@ duration with the Lambda `Billed Duration` and the agent logs:
 ./evidence-async.sh <executionArn>   # a specific execution
 ```
 
-Output (real example):
+Output (from a real run):
 
 ```
+====================================================================
 1) STEP FUNCTIONS — ValidateDispatch state (waitForTaskToken)
-   TaskSubmitted (returned): 14:08:19   <- Lambda handed back control
-   TaskSucceeded (callback): 14:08:34   <- AgentCore woke up the flow
-   >> STATE DURATION        : 19.6s
-   >> WAIT FOR THE AGENT    : 14.7s
-
+====================================================================
+  Entered state           : 09:41:22.170
+  TaskStarted (Lambda)    : 09:41:22.234
+  TaskSubmitted (returned): 09:41:27.721   <- Lambda handed back control
+  TaskSucceeded (callback): 09:41:40.807   <- AgentCore woke up the flow
+  Exited state            : 09:41:40.820
+  >> STATE DURATION        :   18.6s  (Step Functions waiting)
+  >> WAIT FOR THE AGENT    :   13.1s  (between TaskSubmitted and TaskSucceeded)
+====================================================================
 2) LAMBDA — doc-pipeline-validate-dispatcher (CloudWatch REPORT)
-   >> BILLED DURATION       : 4.8s   (time the Lambda ACTUALLY lived/was billed)
-
+====================================================================
+  Duration         :    4.9s
+  >> BILLED DURATION:    5.2s  (time the Lambda ACTUALLY lived/was billed)
+====================================================================
 VERDICT
-   State lasted ........ 19.6s
-   Lambda billed ....... 4.8s
-   Lambda idle avoided   14.9s (76%)
-   ✅ PROVEN: the Lambda did NOT stay blocked waiting for AgentCore.
-
-3) AGENTCORE RUNTIME — "ASYNCHRONOUS mode / background task" + "Waking up via SendTaskSuccess"
+====================================================================
+  State lasted .............   18.6s
+  Lambda billed ............    5.2s
+  Lambda IDLE time avoided .   13.4s  (72% of the time)
+  ✅ PROVEN: the Lambda did NOT stay blocked waiting for AgentCore.
+     It lived 5.2s and died; the agent processed the other
+     ~13s with NO Lambda alive (Step Functions sleeping).
+     In the anti-pattern (await), the Lambda would be billed for the whole ~19s.
+3) AGENTCORE RUNTIME — proof from the agent side (async start + callback)
+====================================================================
+  INFO:doc-pipeline-agent:Starting validation (ASYNCHRONOUS mode / background task)
+  INFO:doc-pipeline-agent:Waking up Step Functions via SendTaskSuccess: {'approved': False, ...}
 ```
 
 The logic: if the Lambda sat there waiting (the `await` anti-pattern), the
 `Billed Duration` would be ~equal to the *state* duration. Since it was billed
-for **4.8s** but the state lasted **19.6s**, it is proven that it died and the
-agent processed the remaining ~15s with no Lambda alive. (For a strategy B
+for **5.2s** but the state lasted **18.6s**, it is proven that it died and the
+agent processed the remaining ~13s with no Lambda alive. (For a strategy B
 execution, the script warns that there is no Lambda to "sit idle".)
 
 ### Manual way — the same data in 3 places
@@ -208,7 +262,7 @@ duration).
 The Lambdas are **Node.js 22 (ESM)**; the AgentCore agent is **Python**.
 
 ```
-template.yaml                       SAM: 2 state machines + Lambdas + IAM + X-Ray
+template.yaml                       SAM: 2 state machines + durable function + Lambdas + IAM + X-Ray
 statemachine/
   pipeline.asl.json                 strategy A (Lambda + waitForTaskToken)
   pipeline-direct.asl.json          strategy B (AgentCore direct, SDK integration)
@@ -220,8 +274,10 @@ functions/                          Lambdas in Node.js (index.mjs)
   validate_result/                  "AFTER" (strategy A): processes the verdict
   organize/                         branch Organize / OrganizeSolo (sleep 2s)
   validate/                         ValidateSolo (sleep 2s, no agent)
-agentcore/                          Agent in Python (dual-mode: async + synchronous)
-  agent.py                          entrypoint + complete_validation tool
+  durable_pipeline/                 strategy C: the whole pipeline as a durable function
+                                    (@aws/durable-execution-sdk-js, bundled via esbuild)
+agentcore/                          Agent in Python (tri-mode: task token / durable callback / synchronous)
+  agent.py                          entrypoint + conclude_validation tool
   Dockerfile  requirements.txt
 events/                             test payloads
 deploy.sh                           provisions everything (credentials + agent + SAM + callback)
@@ -234,6 +290,9 @@ evidence-async.sh                   proves the Lambda did not block (state x Bil
 
 - AWS CLI, **AWS SAM CLI**, Docker, **Node.js 22** (Lambdas) and **Python 3.13** (agent)
 - **Bedrock AgentCore Starter Toolkit**: `pip install bedrock-agentcore-starter-toolkit`
+- A **recent `boto3`/`botocore`** in the environment that runs `agentcore`
+  (`pip install -U boto3 botocore`) — older versions do not know the
+  `bedrock-agentcore-control` service and `agentcore deploy` fails to create the runtime.
 - Access to the model in Bedrock (e.g.: Claude Sonnet) enabled for the account/region
 - Suggested region: `us-east-1`
 
@@ -266,7 +325,7 @@ agentcore deploy            # container build, ECR push and runtime creation
 cd ..
 ```
 
-### 2. Deploy the two state machines (SAM), passing the agent ARN
+### 2. Deploy the pipelines (SAM), passing the agent ARN
 
 ```bash
 sam build
@@ -277,10 +336,12 @@ sam deploy --guided \
 Outputs:
 - `StateMachineArn` — strategy A (Lambda + waitForTaskToken)
 - `StateMachineDirectArn` — strategy B (AgentCore direct)
+- `DurablePipelineFunctionName` / `DurablePipelineAliasArn` — strategy C (durable function)
 - `AgentCallbackPolicyArn` — **attach it to the AgentCore execution role** (needed
-  only for strategy A, where the agent calls `SendTaskSuccess`).
+  for strategy A, where the agent calls `SendTaskSuccess`, and strategy C, where
+  it calls `SendDurableExecutionCallbackSuccess`).
 
-### 3. Connect the callback (once — needed for strategy A)
+### 3. Connect the callback (once — needed for strategies A and C)
 
 ```bash
 aws iam attach-role-policy \
@@ -294,11 +355,23 @@ aws iam attach-role-policy \
 ./run-demo.sh            # strategy A (Lambda + waitForTaskToken) — default
 ./run-demo.sh --direct   # strategy B (AgentCore direct, no Lambda)
 ./run-demo.sh --lambda   # same as A, explicit
+./run-demo.sh --durable  # strategy C (Lambda durable function, no Step Functions)
 ```
 
-The script starts the execution, follows it to the end and prints: the
-**states timeline with durations**, the **agent verdict** (`source: agentcore`)
-and the **X-Ray trace ID**.
+For strategies A and B the script starts the execution, follows it to the end
+and prints: the **states timeline with durations**, the **agent verdict**
+(`source: agentcore`) and the **X-Ray trace ID**.
+
+For strategy C (`--durable`) it invokes the durable function asynchronously
+(qualified `live` alias) and prints where to watch it — durable functions run
+in Lambda, not Step Functions, so there is no execution graph. Follow the
+CloudWatch logs (`/aws/lambda/doc-pipeline-durable`), the Lambda console's
+**Durable executions** tab, or list them by version (the API rejects an alias):
+
+```bash
+VER=$(aws lambda get-alias --function-name doc-pipeline-durable --name live --query FunctionVersion --output text)
+aws lambda list-durable-executions-by-function --function-name doc-pipeline-durable:$VER
+```
 
 ## Observability
 
@@ -308,6 +381,8 @@ and the **X-Ray trace ID**.
 - **Structured logs**: each Node.js Lambda emits JSON (`console.log`) with start/end and duration.
 - **Step Functions logs**: `ALL` in `/aws/vendedlogs/states/doc-pipeline`
   and `/aws/vendedlogs/states/doc-pipeline-direct`.
+- **Durable function logs**: `/aws/lambda/doc-pipeline-durable` (step/checkpoint
+  progress for strategy C).
 - **AgentCore**: logs in `/aws/bedrock-agentcore/runtimes/*`.
 
 > Note: the account has **X-Ray Transaction Search** enabled (destination
@@ -322,11 +397,24 @@ and the **X-Ray trace ID**.
   support long-running processes (up to 8h). Step Functions also has a direct
   integration (strategy B), but synchronous (~15 min) — that is why we keep both
   to compare.
-- **`TimeoutSeconds`/`HeartbeatSeconds`** on `ValidateDispatch` prevent a stuck
-  execution if the agent never calls the callback.
-- **Dual-mode agent:** the same `agent.py` serves both state machines — with a
-  `taskToken` it runs asynchronously (callback); without a `taskToken` it runs
-  synchronously (verdict in the payload).
+- **`TimeoutSeconds`/`HeartbeatSeconds`** on `ValidateDispatch` (and the
+  `waitForCallback` `timeout` in strategy C) prevent a stuck execution if the
+  agent never calls back.
+- **Tri-mode agent:** the same `agent.py` serves all three orchestrations — with
+  a `taskToken` it runs asynchronously and calls `SendTaskSuccess`; with a
+  `callbackId` it runs asynchronously and calls
+  `SendDurableExecutionCallbackSuccess`; with neither it runs synchronously and
+  returns the verdict in the payload.
+- **Durable function IAM (strategy C):** the durable function's execution role
+  needs `lambda:CheckpointDurableExecution`/`GetDurableExecutionState`, and the
+  AgentCore role needs `lambda:SendDurableExecutionCallback*` (added to the same
+  `AgentCallbackPolicy` alongside the Step Functions callback permissions).
+- **Enabling durability (strategy C):** the `DurableConfig` property on the
+  function is what turns on durable execution. It is **create-only** — you cannot
+  add it to an existing function (CloudFormation reports the custom-named resource
+  needs replacing), so changing it requires recreating the function. The function
+  is also invoked through a qualified `live` alias (`AutoPublishAlias`), since
+  durable functions require a qualified identifier.
 - **Demo routing:** the example document contains "CONTRACT/REGISTRATION/FINANCING",
   so Identify sets `shouldOrganize=true` AND `shouldValidate=true` and strategy A
   goes through `OrganizeAndValidateParallel` (Validate next to Organize).

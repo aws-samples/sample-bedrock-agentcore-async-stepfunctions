@@ -49,26 +49,16 @@
       "Catch": [
         { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "PipelineFailed" }
       ],
-      "Next": "ParseAgentResponse"
+      "Next": "ParseVerdict"
     },
 
-    "ParseAgentResponse": {
+    "ParseVerdict": {
       "Type": "Pass",
-      "Comment": "The Response comes as a JSON string (e.g. {\"validation\": {...}}); converts it to an object and exposes the verdict at $.validation.",
+      "Comment": "The agent Response comes as a JSON string (e.g. {\"validation\": {...}}); converts it to an object so the verdict is available at $.agentParsed.result.validation.",
       "Parameters": {
-        "parsed.$": "States.StringToJson($.agentRaw.raw)"
+        "result.$": "States.StringToJson($.agentRaw.raw)"
       },
       "ResultPath": "$.agentParsed",
-      "Next": "ExtractVerdict"
-    },
-
-    "ExtractVerdict": {
-      "Type": "Pass",
-      "Comment": "Promotes the agent verdict to $.validation (same shape as the Lambda version).",
-      "Parameters": {
-        "validation.$": "$.agentParsed.parsed.validation"
-      },
-      "ResultPath": "$.result",
       "Next": "PipelineCompleted"
     },
 

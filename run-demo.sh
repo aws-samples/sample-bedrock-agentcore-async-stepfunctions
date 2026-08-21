@@ -19,8 +19,9 @@ export AWS_DEFAULT_REGION="$AWS_REGION"
 STACK="doc-pipeline"
 INPUT_FILE="$(dirname "$0")/events/start-execution.json"
 WAIT=true
-# Which pipeline to run: "lambda" (default, waitForTaskToken + Lambda) or
-# "direct" (AgentCore called directly from Step Functions, no Lambda).
+# Which pipeline to run: "lambda" (default, waitForTaskToken + Lambda),
+# "direct" (AgentCore called directly from Step Functions, no Lambda) or
+# "durable" (Pattern 3 — Lambda durable function, no Step Functions at all).
 PIPELINE="lambda"
 OUTPUT_KEY="StateMachineArn"
 for arg in "$@"; do
@@ -28,9 +29,38 @@ for arg in "$@"; do
     --no-wait) WAIT=false ;;
     --direct)  PIPELINE="direct"; OUTPUT_KEY="StateMachineDirectArn" ;;
     --lambda)  PIPELINE="lambda"; OUTPUT_KEY="StateMachineArn" ;;
+    --durable) PIPELINE="durable" ;;
   esac
 done
 echo "Pipeline: $PIPELINE"
+
+# --- Pattern 3 (durable function) has no state machine — invoke the Lambda ---
+if [[ "$PIPELINE" == "durable" ]]; then
+  FN="doc-pipeline-durable"
+  NAME="demo-$(date +%Y%m%d-%H%M%S)"
+  echo "Durable function : $FN (qualifier: live)"
+  echo "Execution name   : $NAME"
+  echo "Input            : $INPUT_FILE"
+  echo
+  # Durable functions require a qualified identifier; async invoke (Event) queues
+  # it and returns immediately. --durable-execution-name gives idempotency.
+  aws lambda invoke \
+    --function-name "$FN" --qualifier live \
+    --invocation-type Event \
+    --durable-execution-name "$NAME" \
+    --cli-binary-format raw-in-base64-out \
+    --payload "file://$INPUT_FILE" \
+    /tmp/docpipeline_durable_invoke.json >/dev/null \
+    || { echo "ERROR: invoke failed — is the stack deployed?" >&2; exit 1; }
+  echo "Durable execution started (async). Watch progress in:"
+  echo "  CloudWatch logs : /aws/lambda/$FN"
+  echo "  AgentCore logs  : /aws/bedrock-agentcore/runtimes/*"
+  echo
+  echo "Inspect the durable execution (list needs a version number, not the alias):"
+  echo "  VER=\$(aws lambda get-alias --function-name $FN --name live --query FunctionVersion --output text --region $AWS_REGION)"
+  echo "  aws lambda list-durable-executions-by-function --function-name $FN:\$VER --region $AWS_REGION"
+  exit 0
+fi
 
 # --- discover the state machine ARN from the stack output -------------------
 SM_ARN=$(aws cloudformation describe-stacks --stack-name "$STACK" \
