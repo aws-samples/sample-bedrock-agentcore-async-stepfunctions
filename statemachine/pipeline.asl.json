@@ -1,11 +1,11 @@
 {
-  "Comment": "PoC flow-credi: pipeline de documentos. Extract -> Identify(sync) -> RouteAfterIdentify -> (Parallel | OrganizeSolo | ValidateSolo[waitForTaskToken/AgentCore]) -> PipelineCompleted. Catch global -> PipelineFailed.",
+  "Comment": "Document pipeline: Extract -> Identify(sync) -> RouteAfterIdentify -> (Parallel | OrganizeSolo | ValidateSolo[waitForTaskToken/AgentCore]) -> PipelineCompleted. Global catch -> PipelineFailed.",
   "StartAt": "Extract",
   "States": {
     "Extract": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
-      "Comment": "OCR/extracao (Lambda simula 2s + logs estruturados)",
+      "Comment": "OCR/extraction (Lambda simulates 2s + structured logs)",
       "Parameters": {
         "FunctionName": "${ExtractFunctionArn}",
         "Payload.$": "$"
@@ -32,7 +32,7 @@
     "Identify": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
-      "Comment": "Classifica o documento e decide as flags de roteamento (Lambda sincrona, sleep 2s). Nao chama o agente.",
+      "Comment": "Classifies the document and decides the routing flags (synchronous Lambda, sleep 2s). Does not call the agent.",
       "Parameters": {
         "FunctionName": "${IdentifyFunctionArn}",
         "Payload.$": "$"
@@ -58,7 +58,7 @@
 
     "RouteAfterIdentify": {
       "Type": "Choice",
-      "Comment": "Roteia conforme as flags retornadas pelo agente",
+      "Comment": "Routes based on the flags returned by Identify",
       "Choices": [
         {
           "And": [
@@ -83,7 +83,7 @@
 
     "OrganizeAndValidateParallel": {
       "Type": "Parallel",
-      "Comment": "Organize + Validate em paralelo (ambas flags true)",
+      "Comment": "Organize + Validate in parallel (both flags true)",
       "ResultPath": "$.parallelResult",
       "Branches": [
         {
@@ -107,7 +107,7 @@
             "ValidateDispatch": {
               "Type": "Task",
               "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
-              "Comment": "ETAPA ANTES DO AGENTE (branch Validate, ao lado do Organize). Dispara o agente (validate_dispatcher) passando o taskToken e RETORNA na hora — a Lambda morre em ~1-4s. Este branch do Parallel DORME (sem custo) ate o agente chamar SendTaskSuccess (~15s). Nenhuma Lambda fica viva durante esse periodo.",
+              "Comment": "STEP BEFORE THE AGENT (Validate branch, next to Organize). Dispatches the agent (validate_dispatcher) passing the taskToken and RETURNS immediately — the Lambda dies in ~1-4s. This Parallel branch SLEEPS (at no cost) until the agent calls SendTaskSuccess (~15s). No Lambda stays alive during that period.",
               "Parameters": {
                 "FunctionName": "${ValidateDispatcherFunctionArn}",
                 "Payload": {
@@ -120,17 +120,17 @@
               "TimeoutSeconds": 120,
               "HeartbeatSeconds": 60,
               "ResultPath": "$.validation",
-              "Next": "AgentCoreValidacao"
+              "Next": "AgentCoreValidation"
             },
-            "AgentCoreValidacao": {
+            "AgentCoreValidation": {
               "Type": "Pass",
-              "Comment": "VISUAL: representa o processamento do Bedrock AgentCore (~15s). Enquanto este 'no' esta ativo, o ValidateDispatch ja terminou (waitForTaskToken) e nenhuma Lambda esta viva — o agente valida o documento e acorda o fluxo via SendTaskSuccess. Pass state nao adiciona custo nem altera os dados.",
+              "Comment": "VISUAL: represents the Bedrock AgentCore processing (~15s). While this 'node' is active, ValidateDispatch has already finished (waitForTaskToken) and no Lambda is alive — the agent validates the document and wakes the flow via SendTaskSuccess. A Pass state adds no cost and does not change the data.",
               "Next": "ValidateResult"
             },
             "ValidateResult": {
               "Type": "Task",
               "Resource": "arn:aws:states:::lambda:invoke",
-              "Comment": "ETAPA DEPOIS DO AGENTE. Roda quando o branch ACORDA (apos o callback). Uma NOVA Lambda processa o veredito devolvido pelo agente. Prova logica antes e depois, sem manter Lambda viva durante o processamento do agente.",
+              "Comment": "STEP AFTER THE AGENT. Runs when the branch WAKES UP (after the callback). A NEW Lambda processes the verdict returned by the agent. Proves logic before and after, without keeping a Lambda alive during the agent processing.",
               "Parameters": {
                 "FunctionName": "${ValidateResultFunctionArn}",
                 "Payload.$": "$"
@@ -172,7 +172,7 @@
     "ValidateSolo": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
-      "Comment": "Validacao 'leve' quando so shouldValidate=true (sem organizar). Lambda simples (sleep 2s). A validacao via agente acontece no branch Validate do Parallel.",
+      "Comment": "'Light' validation when only shouldValidate=true (without organizing). Simple Lambda (sleep 2s). Agent-based validation happens in the Validate branch of the Parallel.",
       "Parameters": {
         "FunctionName": "${ValidateFunctionArn}",
         "Payload.$": "$"
@@ -190,12 +190,12 @@
 
     "PipelineCompleted": {
       "Type": "Succeed",
-      "Comment": "Fluxo concluido com sucesso"
+      "Comment": "Flow completed successfully"
     },
 
     "PipelineFailed": {
       "Type": "Fail",
-      "Comment": "Falha em alguma etapa do pipeline",
+      "Comment": "Failure in some pipeline step",
       "Error": "PipelineError",
       "CausePath": "States.JsonToString($.error)"
     }

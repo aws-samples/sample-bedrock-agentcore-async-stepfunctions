@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
-# deploy.sh — provisiona TODA a PoC flow-credi do zero:
-#   1. verifica credencial e ferramentas
-#   2. deploya o agente no Bedrock AgentCore (configure + deploy)
-#   3. deploya o stack SAM (2 state machines + lambdas + IAM + X-Ray)
-#   4. anexa a managed policy de callback a execution role do AgentCore
-#   5. valida com uma execucao de teste (opcional)
+# deploy.sh — provisions the WHOLE document pipeline from scratch:
+#   1. checks credentials and tools
+#   2. deploys the agent to Bedrock AgentCore (configure + deploy)
+#   3. deploys the SAM stack (2 state machines + lambdas + IAM + X-Ray)
+#   4. attaches the callback managed policy to the AgentCore execution role
+#   5. validates with a test execution (optional)
 #
-# Uso:
-#   ./deploy.sh                # deploy completo
-#   ./deploy.sh --skip-agent   # NAO redeploya o agente (reaproveita o existente)
-#   ./deploy.sh --no-test      # nao roda a execucao de validacao no final
+# Usage:
+#   ./deploy.sh                # full deploy
+#   ./deploy.sh --skip-agent   # does NOT redeploy the agent (reuses the existing one)
+#   ./deploy.sh --no-test      # does not run the validation execution at the end
 #
 set -euo pipefail
 
@@ -21,8 +21,8 @@ export AWS_REGION="us-east-1"
 export AWS_DEFAULT_REGION="$AWS_REGION"
 export AGENTCORE_SUPPRESS_RECOMMENDATION=1
 
-STACK="flow-credi-poc"
-AGENT_NAME="flowcredi"
+STACK="doc-pipeline"
+AGENT_NAME="docpipeline"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 AGENT_DIR="$ROOT/agentcore"
 AGENT_CFG="$AGENT_DIR/.bedrock_agentcore.yaml"
@@ -42,42 +42,42 @@ c_err()  { printf "\033[31m✗ %s\033[0m\n" "$1" >&2; }
 die()    { c_err "$1"; exit 1; }
 
 # ---------------------------------------------------------------------------
-# 1. Pre-flight: ferramentas + credencial
+# 1. Pre-flight: tools + credentials
 # ---------------------------------------------------------------------------
-c_info "Verificando ferramentas..."
+c_info "Checking tools..."
 for bin in aws sam docker node python3 agentcore; do
-  command -v "$bin" >/dev/null 2>&1 || die "Ferramenta nao encontrada no PATH: $bin"
+  command -v "$bin" >/dev/null 2>&1 || die "Tool not found in PATH: $bin"
 done
-docker info >/dev/null 2>&1 || die "Docker nao esta rodando (necessario para o build do agente)."
-c_ok "Ferramentas presentes (aws, sam, docker, node, python3, agentcore)"
+docker info >/dev/null 2>&1 || die "Docker is not running (required to build the agent)."
+c_ok "Tools present (aws, sam, docker, node, python3, agentcore)"
 
-c_info "Verificando credencial AWS..."
+c_info "Checking AWS credentials..."
 CALLER=$(aws sts get-caller-identity --output json 2>/dev/null) \
-  || die "Credencial AWS nao configurada / expirada. Rode 'aws configure' ou exporte as chaves."
+  || die "AWS credentials not configured / expired. Run 'aws configure' or export the keys."
 ACCOUNT=$(echo "$CALLER" | python3 -c "import json,sys;print(json.load(sys.stdin)['Account'])")
 ARN=$(echo "$CALLER" | python3 -c "import json,sys;print(json.load(sys.stdin)['Arn'])")
-c_ok "Credencial OK — conta $ACCOUNT em $AWS_REGION"
-echo "    Identidade: $ARN"
+c_ok "Credentials OK — account $ACCOUNT in $AWS_REGION"
+echo "    Identity: $ARN"
 echo
 
 # ---------------------------------------------------------------------------
-# 2. Agente no Bedrock AgentCore
+# 2. Agent on Bedrock AgentCore
 # ---------------------------------------------------------------------------
 if [[ "$SKIP_AGENT" == "false" ]]; then
-  c_info "Deployando o agente no Bedrock AgentCore (pode levar alguns minutos)..."
+  c_info "Deploying the agent to Bedrock AgentCore (may take a few minutes)..."
   ( cd "$AGENT_DIR"
     if [[ ! -f .bedrock_agentcore.yaml ]]; then
       agentcore configure --entrypoint agent.py --name "$AGENT_NAME" \
         --region "$AWS_REGION" --non-interactive >/dev/null
     fi
     agentcore deploy >/dev/null )
-  c_ok "Agente deployado"
+  c_ok "Agent deployed"
 else
-  c_info "--skip-agent: reaproveitando o agente existente"
+  c_info "--skip-agent: reusing the existing agent"
 fi
 
-# extrai ARN e execution role do config do agente
-[[ -f "$AGENT_CFG" ]] || die "Config do agente nao encontrado ($AGENT_CFG). Rode sem --skip-agent."
+# extract ARN and execution role from the agent config
+[[ -f "$AGENT_CFG" ]] || die "Agent config not found ($AGENT_CFG). Run without --skip-agent."
 AGENT_ARN=$(python3 - "$AGENT_CFG" << 'PY'
 import sys, re
 txt = open(sys.argv[1]).read()
@@ -88,37 +88,37 @@ PY
 AGENT_ROLE=$(python3 - "$AGENT_CFG" << 'PY'
 import sys, re
 txt = open(sys.argv[1]).read()
-# pega o primeiro execution_role que seja um ARN (ignora "null")
+# take the first execution_role that is an ARN (ignore "null")
 for m in re.finditer(r'execution_role:\s*(\S+)', txt):
     v = m.group(1)
     if v.startswith("arn:"):
         print(v); break
 PY
 )
-[[ "$AGENT_ARN" == arn:* ]]  || die "Nao consegui extrair o agent_arn do config do agente."
-[[ "$AGENT_ROLE" == arn:* ]] || die "Nao consegui extrair a execution_role do agente."
+[[ "$AGENT_ARN" == arn:* ]]  || die "Could not extract agent_arn from the agent config."
+[[ "$AGENT_ROLE" == arn:* ]] || die "Could not extract execution_role from the agent."
 AGENT_ROLE_NAME="${AGENT_ROLE##*/}"
 c_ok "Agent ARN : $AGENT_ARN"
 c_ok "Exec role : $AGENT_ROLE_NAME"
 echo
 
 # ---------------------------------------------------------------------------
-# 3. Stack SAM (2 state machines + lambdas)
+# 3. SAM stack (2 state machines + lambdas)
 # ---------------------------------------------------------------------------
-c_info "Build SAM..."
-( cd "$ROOT" && sam build >/dev/null ) || die "sam build falhou"
-c_ok "Build concluido"
+c_info "SAM build..."
+( cd "$ROOT" && sam build >/dev/null ) || die "sam build failed"
+c_ok "Build finished"
 
-c_info "Deploy SAM (stack $STACK)..."
+c_info "SAM deploy (stack $STACK)..."
 ( cd "$ROOT" && sam deploy \
     --stack-name "$STACK" --region "$AWS_REGION" \
     --capabilities CAPABILITY_NAMED_IAM --resolve-s3 \
     --no-confirm-changeset --no-fail-on-empty-changeset \
     --parameter-overrides AgentRuntimeArn="$AGENT_ARN" >/dev/null ) \
-  || die "sam deploy falhou"
-c_ok "Stack deployado"
+  || die "sam deploy failed"
+c_ok "Stack deployed"
 
-# le outputs
+# read outputs
 get_out() {
   aws cloudformation describe-stacks --stack-name "$STACK" \
     --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
@@ -129,25 +129,25 @@ CALLBACK_POLICY=$(get_out AgentCallbackPolicyArn)
 echo
 
 # ---------------------------------------------------------------------------
-# 4. Anexa a policy de callback a execution role do agente
+# 4. Attach the callback policy to the agent execution role
 # ---------------------------------------------------------------------------
-c_info "Anexando policy de callback a role do AgentCore..."
+c_info "Attaching callback policy to the AgentCore role..."
 aws iam attach-role-policy --role-name "$AGENT_ROLE_NAME" \
   --policy-arn "$CALLBACK_POLICY" >/dev/null
-c_ok "Policy de callback anexada ($CALLBACK_POLICY)"
+c_ok "Callback policy attached ($CALLBACK_POLICY)"
 echo
 
 # ---------------------------------------------------------------------------
-# 5. Resumo + teste opcional
+# 5. Summary + optional test
 # ---------------------------------------------------------------------------
-c_ok "DEPLOY COMPLETO"
-echo "  Conta            : $ACCOUNT ($AWS_REGION)"
+c_ok "DEPLOY COMPLETE"
+echo "  Account          : $ACCOUNT ($AWS_REGION)"
 echo "  Agent runtime    : $AGENT_ARN"
 echo "  Pipeline (Lambda): $SM_LAMBDA"
-echo "  Pipeline (direto): $SM_DIRECT"
+echo "  Pipeline (direct): $SM_DIRECT"
 echo
 
 if [[ "$RUN_TEST" == "true" ]]; then
-  c_info "Rodando execucao de validacao (estrategia A — Lambda)..."
-  "$ROOT/run-demo.sh" --lambda || c_err "teste falhou (veja o console)"
+  c_info "Running validation execution (strategy A — Lambda)..."
+  "$ROOT/run-demo.sh" --lambda || c_err "test failed (check the console)"
 fi

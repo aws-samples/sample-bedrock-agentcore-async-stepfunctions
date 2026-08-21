@@ -1,6 +1,6 @@
 {
   "document": {
-    "key": "documentos/matricula-12345.pdf",
-    "tipo": "matricula"
+    "key": "documents/registration-12345.pdf",
+    "type": "registration"
   }
 }

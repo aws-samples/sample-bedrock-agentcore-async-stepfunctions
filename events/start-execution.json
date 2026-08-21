@@ -1,7 +1,7 @@
 {
   "document": {
-    "key": "documentos/matricula-12345.pdf",
-    "bucket": "exemplo-flow-credi",
-    "tipo": "matricula"
+    "key": "documents/registration-12345.pdf",
+    "bucket": "example-doc-pipeline",
+    "type": "registration"
   }
 }
