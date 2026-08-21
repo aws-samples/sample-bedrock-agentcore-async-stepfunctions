@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #
-# destroy.sh — remove TUDO que o deploy.sh criou:
-#   1. desanexa a policy de callback da execution role do AgentCore
-#   2. deleta o stack SAM (state machines, lambdas, IAM, log groups)
-#   3. destroi o runtime do AgentCore (runtime, memoria, role, artefatos S3)
+# destroy.sh — removes EVERYTHING that deploy.sh created:
+#   1. detaches the callback policy from the AgentCore execution role
+#   2. deletes the SAM stack (state machines, lambdas, IAM, log groups)
+#   3. destroys the AgentCore runtime (runtime, memory, role, S3 artifacts)
 #
-# Uso:
-#   ./destroy.sh             # pede confirmacao
-#   ./destroy.sh --yes       # nao pergunta (CI / automacao)
-#   ./destroy.sh --keep-agent  # NAO destroi o agente (so o stack SAM)
+# Usage:
+#   ./destroy.sh             # asks for confirmation
+#   ./destroy.sh --yes       # no prompt (CI / automation)
+#   ./destroy.sh --keep-agent  # does NOT destroy the agent (only the SAM stack)
 #
 set -euo pipefail
 
@@ -16,7 +16,7 @@ export AWS_REGION="us-east-1"
 export AWS_DEFAULT_REGION="$AWS_REGION"
 export AGENTCORE_SUPPRESS_RECOMMENDATION=1
 
-STACK="flow-credi-poc"
+STACK="doc-pipeline"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 AGENT_DIR="$ROOT/agentcore"
 AGENT_CFG="$AGENT_DIR/.bedrock_agentcore.yaml"
@@ -35,25 +35,25 @@ c_info() { printf "\033[36m▶\033[0m %s\n" "$1"; }
 c_warn() { printf "\033[33m! %s\033[0m\n" "$1"; }
 c_err()  { printf "\033[31m✗ %s\033[0m\n" "$1" >&2; }
 
-# credencial
-aws sts get-caller-identity >/dev/null 2>&1 || { c_err "Credencial AWS nao configurada."; exit 1; }
+# credentials
+aws sts get-caller-identity >/dev/null 2>&1 || { c_err "AWS credentials not configured."; exit 1; }
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 
-echo "Vai REMOVER os recursos da PoC flow-credi:"
-echo "  - Stack SAM         : $STACK"
-echo "  - Policy de callback: desanexada da role do AgentCore"
-[[ "$KEEP_AGENT" == "false" ]] && echo "  - AgentCore runtime : destruido (runtime, memoria, role, S3)"
-echo "  Conta: $ACCOUNT ($AWS_REGION)"
+echo "About to REMOVE the document pipeline resources:"
+echo "  - SAM stack         : $STACK"
+echo "  - Callback policy   : detached from the AgentCore role"
+[[ "$KEEP_AGENT" == "false" ]] && echo "  - AgentCore runtime : destroyed (runtime, memory, role, S3)"
+echo "  Account: $ACCOUNT ($AWS_REGION)"
 echo
 
 if [[ "$ASSUME_YES" != "true" ]]; then
-  read -r -p "Confirmar destruicao? [y/N] " resp
-  [[ "$resp" == "y" || "$resp" == "Y" ]] || { echo "Cancelado."; exit 0; }
+  read -r -p "Confirm destruction? [y/N] " resp
+  [[ "$resp" == "y" || "$resp" == "Y" ]] || { echo "Cancelled."; exit 0; }
 fi
 echo
 
 # ---------------------------------------------------------------------------
-# 1. Desanexar a policy de callback da role do AgentCore (antes de deletar o stack)
+# 1. Detach the callback policy from the AgentCore role (before deleting the stack)
 # ---------------------------------------------------------------------------
 CALLBACK_POLICY=$(aws cloudformation describe-stacks --stack-name "$STACK" \
   --query "Stacks[0].Outputs[?OutputKey=='AgentCallbackPolicyArn'].OutputValue" \
@@ -73,44 +73,44 @@ PY
 fi
 
 if [[ -n "$CALLBACK_POLICY" && "$CALLBACK_POLICY" != "None" && -n "$AGENT_ROLE_NAME" ]]; then
-  c_info "Desanexando policy de callback da role $AGENT_ROLE_NAME..."
+  c_info "Detaching callback policy from role $AGENT_ROLE_NAME..."
   aws iam detach-role-policy --role-name "$AGENT_ROLE_NAME" \
     --policy-arn "$CALLBACK_POLICY" >/dev/null 2>&1 \
-    && c_ok "Policy desanexada" \
-    || c_warn "Policy ja estava desanexada (ou role inexistente)"
+    && c_ok "Policy detached" \
+    || c_warn "Policy was already detached (or role does not exist)"
 else
-  c_warn "Nao achei policy/role para desanexar (stack ou config ausente) — seguindo"
+  c_warn "Could not find policy/role to detach (stack or config missing) — continuing"
 fi
 echo
 
 # ---------------------------------------------------------------------------
-# 2. Deletar o stack SAM
+# 2. Delete the SAM stack
 # ---------------------------------------------------------------------------
 if aws cloudformation describe-stacks --stack-name "$STACK" >/dev/null 2>&1; then
-  c_info "Deletando stack SAM $STACK..."
+  c_info "Deleting SAM stack $STACK..."
   ( cd "$ROOT" && sam delete --stack-name "$STACK" --region "$AWS_REGION" --no-prompts >/dev/null )
-  c_ok "Stack deletado"
+  c_ok "Stack deleted"
 else
-  c_warn "Stack $STACK nao existe — nada a deletar"
+  c_warn "Stack $STACK does not exist — nothing to delete"
 fi
 echo
 
 # ---------------------------------------------------------------------------
-# 3. Destruir o runtime do AgentCore
+# 3. Destroy the AgentCore runtime
 # ---------------------------------------------------------------------------
 if [[ "$KEEP_AGENT" == "true" ]]; then
-  c_warn "--keep-agent: runtime do AgentCore preservado"
+  c_warn "--keep-agent: AgentCore runtime preserved"
 elif [[ -f "$AGENT_CFG" ]]; then
-  c_info "Destruindo o runtime do AgentCore..."
+  c_info "Destroying the AgentCore runtime..."
   ( cd "$AGENT_DIR" && yes | agentcore destroy >/dev/null 2>&1 ) \
-    && c_ok "AgentCore destruido" \
-    || c_warn "agentcore destroy reportou erro (pode ja ter sido removido)"
+    && c_ok "AgentCore destroyed" \
+    || c_warn "agentcore destroy reported an error (it may have already been removed)"
 else
-  c_warn "Config do agente ausente — nada a destruir no AgentCore"
+  c_warn "Agent config missing — nothing to destroy in AgentCore"
 fi
 echo
 
-c_ok "TEARDOWN COMPLETO"
-c_warn "Lembrete: se voce subiu o X-Ray Transaction Search para 100%, reverta com:"
+c_ok "TEARDOWN COMPLETE"
+c_warn "Reminder: if you raised X-Ray Transaction Search to 100%, revert it with:"
 echo "    aws xray update-indexing-rule --name Default \\"
 echo "      --rule '{\"Probabilistic\":{\"DesiredSamplingPercentage\":1.0}}' --region $AWS_REGION"

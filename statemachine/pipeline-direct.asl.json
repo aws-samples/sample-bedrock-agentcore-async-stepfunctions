@@ -1,11 +1,11 @@
 {
-  "Comment": "PoC flow-credi (DIRETO): demonstra a chamada do Bedrock AgentCore DIRETO do Step Functions, via SDK integration (invokeAgentRuntime), SEM Lambda dispatcher. Extract -> Identify -> ValidateDireto (AgentCore) -> PipelineCompleted.",
+  "Comment": "Document pipeline (DIRECT): demonstrates calling Bedrock AgentCore DIRECTLY from Step Functions, via SDK integration (invokeAgentRuntime), with NO Lambda dispatcher. Extract -> Identify -> ValidateDirect (AgentCore) -> PipelineCompleted.",
   "StartAt": "Extract",
   "States": {
     "Extract": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
-      "Comment": "OCR/extracao (Lambda simula 2s)",
+      "Comment": "OCR/extraction (Lambda simulates 2s)",
       "Parameters": {
         "FunctionName": "${ExtractFunctionArn}",
         "Payload.$": "$"
@@ -20,7 +20,7 @@
     "Identify": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
-      "Comment": "Classifica o documento (Lambda sincrona, sleep 2s).",
+      "Comment": "Classifies the document (synchronous Lambda, sleep 2s).",
       "Parameters": {
         "FunctionName": "${IdentifyFunctionArn}",
         "Payload.$": "$"
@@ -29,12 +29,12 @@
       "Catch": [
         { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "PipelineFailed" }
       ],
-      "Next": "ValidateDireto"
+      "Next": "ValidateDirect"
     },
 
-    "ValidateDireto": {
+    "ValidateDirect": {
       "Type": "Task",
-      "Comment": "CHAMADA DIRETA AO AGENTCORE — sem Lambda. SDK integration invokeAgentRuntime (request-response sincrono). O Step Functions fica esperando o agente responder (~15s) e recebe o veredito direto no resultado. Compare com a versao com Lambda dispatcher + waitForTaskToken.",
+      "Comment": "DIRECT CALL TO AGENTCORE — no Lambda. SDK integration invokeAgentRuntime (synchronous request-response). Step Functions waits for the agent to respond (~15s) and receives the verdict directly in the result. Compare with the version using Lambda dispatcher + waitForTaskToken.",
       "Resource": "arn:aws:states:::aws-sdk:bedrockagentcore:invokeAgentRuntime",
       "Parameters": {
         "AgentRuntimeArn": "${AgentRuntimeArn}",
@@ -54,27 +54,27 @@
 
     "ParseAgentResponse": {
       "Type": "Pass",
-      "Comment": "O Response vem como string JSON (ex.: {\"validation\": {...}}); converte em objeto e expoe o veredito em $.validation.",
+      "Comment": "The Response comes as a JSON string (e.g. {\"validation\": {...}}); converts it to an object and exposes the verdict at $.validation.",
       "Parameters": {
         "parsed.$": "States.StringToJson($.agentRaw.raw)"
       },
       "ResultPath": "$.agentParsed",
-      "Next": "ExtrairVeredito"
+      "Next": "ExtractVerdict"
     },
 
-    "ExtrairVeredito": {
+    "ExtractVerdict": {
       "Type": "Pass",
-      "Comment": "Promove o veredito do agente para $.validation (mesma forma da versao com Lambda).",
+      "Comment": "Promotes the agent verdict to $.validation (same shape as the Lambda version).",
       "Parameters": {
         "validation.$": "$.agentParsed.parsed.validation"
       },
-      "ResultPath": "$.resultado",
+      "ResultPath": "$.result",
       "Next": "PipelineCompleted"
     },
 
     "PipelineCompleted": {
       "Type": "Succeed",
-      "Comment": "Fluxo (direto) concluido com sucesso"
+      "Comment": "Flow (direct) completed successfully"
     },
 
     "PipelineFailed": {

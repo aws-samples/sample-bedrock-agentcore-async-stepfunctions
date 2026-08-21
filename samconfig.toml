@@ -1,7 +1,7 @@
 version = 0.1
 
 [default.global.parameters]
-stack_name = "flow-credi-poc"
+stack_name = "doc-pipeline"
 
 [default.build.parameters]
 cached = true
@@ -12,5 +12,5 @@ capabilities = "CAPABILITY_NAMED_IAM"
 confirm_changeset = true
 resolve_s3 = true
 region = "us-east-1"
-# Informe o ARN do AgentCore Runtime apos rodar `agentcore deploy`:
-# parameter_overrides = "AgentRuntimeArn=arn:aws:bedrock-agentcore:us-east-1:ACCOUNT:runtime/sup-agent-XXXX"
+# Provide the AgentCore Runtime ARN after running `agentcore deploy`:
+# parameter_overrides = "AgentRuntimeArn=arn:aws:bedrock-agentcore:us-east-1:ACCOUNT:runtime/docpipeline-XXXX"

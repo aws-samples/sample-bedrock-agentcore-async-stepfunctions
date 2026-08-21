@@ -1,179 +1,186 @@
-# PoC flow-credi — Pipeline de Documentos com Bedrock AgentCore
+# Document Pipeline with Bedrock AgentCore
 
-> **Objetivo da demo:** validar documentos de financiamento imobiliário com um agente do
-> **Bedrock AgentCore** (~15s de processamento) dentro de um pipeline do **Step Functions**,
-> mostrando como **não desperdiçar custo de Lambda** enquanto o agente trabalha.
+> **Goal of the demo:** validate real estate financing documents with a
+> **Bedrock AgentCore** agent (~15s of processing) inside a **Step Functions**
+> pipeline, showing how to **not waste Lambda cost** while the agent works.
 
-Demonstra, com infraestrutura como código (AWS SAM), **duas estratégias** para integrar um
-agente do Bedrock AgentCore a um pipeline do Step Functions sem manter uma Lambda bloqueada
-durante o processamento do agente.
+Demonstrates, with infrastructure as code (AWS SAM), **two strategies** for
+integrating a Bedrock AgentCore agent into a Step Functions pipeline without
+keeping a Lambda blocked during the agent's processing.
 
-O projeto deploya **duas state machines** que fazem a mesma coisa por caminhos diferentes,
-para comparar lado a lado:
+The project deploys **two state machines** that do the same thing via different
+paths, so you can compare them side by side:
 
-| Estratégia | State machine | Como chama o AgentCore |
+| Strategy | State machine | How it calls AgentCore |
 |---|---|---|
-| **A — com Lambda** | `flow-credi-document-pipeline` | Lambda dispatcher + `lambda:invoke.waitForTaskToken` (assíncrono) |
-| **B — direto** | `flow-credi-pipeline-direct` | `aws-sdk:bedrockagentcore:invokeAgentRuntime` — **sem Lambda** (síncrono) |
+| **A — with Lambda** | `doc-pipeline` | Lambda dispatcher + `lambda:invoke.waitForTaskToken` (asynchronous) |
+| **B — direct** | `doc-pipeline-direct` | `aws-sdk:bedrockagentcore:invokeAgentRuntime` — **no Lambda** (synchronous) |
 
 ---
 
-## Estratégia A — Lambda + `waitForTaskToken` (assíncrono)
+## Strategy A — Lambda + `waitForTaskToken` (asynchronous)
 
-A chamada ao AgentCore acontece no branch **Validate** do `OrganizeAndValidateParallel`
-(ao lado do `Organize`). O branch tem duas Lambdas com o agente no meio.
+The AgentCore call happens in the **Validate** branch of
+`OrganizeAndValidateParallel` (next to `Organize`). The branch has two Lambdas
+with the agent in the middle.
 
 ```
 StartExecution
    │
-   ▼ Step Functions: flow-credi-document-pipeline (STANDARD)
+   ▼ Step Functions: doc-pipeline (STANDARD)
    Extract     Lambda · sleep 2s
-   Identify    Lambda · sleep 2s · decide flags (NÃO chama o agente)
+   Identify    Lambda · sleep 2s · decides flags (does NOT call the agent)
    RouteAfterIdentify (Choice)
     ├─ shouldOrganize && shouldValidate → OrganizeAndValidateParallel
     │     ┌─ branch Organize ──┐   ┌─ branch Validate ─────────────────────────┐
     │     │ Organize (sleep 2s)│   │ ValidateDispatch  (Lambda, waitForTaskToken)│
-    │     │                    │   │   → invoca o AgentCore e RETORNA (morre ~5s)│
-    │     │                    │   │   → o branch DORME sem custo                │
-    │     │                    │   │        ▼ (AgentCore valida ~15-25s)         │
-    │     │                    │   │   SendTaskSuccess ← tool concluir_validacao │
-    │     │                    │   │ AgentCoreValidacao  (Pass, marcador visual) │
-    │     │                    │   │ ValidateResult    (Lambda) processa veredito│
+    │     │                    │   │   → invokes AgentCore and RETURNS (dies ~5s)│
+    │     │                    │   │   → the branch SLEEPS at no cost           │
+    │     │                    │   │        ▼ (AgentCore validates ~15-25s)     │
+    │     │                    │   │   SendTaskSuccess ← tool complete_validation│
+    │     │                    │   │ AgentCoreValidation (Pass, visual marker)  │
+    │     │                    │   │ ValidateResult    (Lambda) processes verdict│
     │     └────────────────────┘   └─────────────────────────────────────────────┘
     ├─ shouldOrganize → OrganizeSolo  (Lambda · sleep 2s)
     ├─ shouldValidate → ValidateSolo  (Lambda · sleep 2s)
     └─ default → PipelineCompleted
-   (erros) ─Catch─> PipelineFailed
+   (errors) ─Catch─> PipelineFailed
 ```
 
-- O agente roda em modo **assíncrono** (`@app.async_task`): o entrypoint retorna na hora e
-  o trabalho de ~15s acontece em background; ao concluir, a tool `concluir_validacao` chama
-  `SendTaskSuccess(taskToken)` e **acorda** o Step Functions.
-- A Lambda `ValidateDispatch` só repassa o token e morre — **não fica esperando o agente**.
+- The agent runs in **asynchronous** mode (`@app.async_task`): the entrypoint
+  returns right away and the ~15s of work happens in the background; when it
+  finishes, the `complete_validation` tool calls `SendTaskSuccess(taskToken)`
+  and **wakes up** Step Functions.
+- The `ValidateDispatch` Lambda only forwards the token and dies — it **does not
+  wait for the agent**.
 
-**Quando usar:** processos longos (até 8h de agente), múltiplos agentes em paralelo, ou
-quando você quer desacoplar e não pagar nada durante a espera.
+**When to use:** long-running processes (up to 8h of agent time), multiple
+agents in parallel, or when you want to decouple and pay nothing during the wait.
 
 ---
 
-## Estratégia B — chamada direta do Step Functions (síncrono)
+## Strategy B — direct call from Step Functions (synchronous)
 
-O Step Functions chama o AgentCore **diretamente**, via SDK integration, sem Lambda
-nenhuma no meio.
+Step Functions calls AgentCore **directly**, via SDK integration, with no Lambda
+in the middle.
 
 ```
 StartExecution
    │
-   ▼ Step Functions: flow-credi-pipeline-direct (STANDARD)
+   ▼ Step Functions: doc-pipeline-direct (STANDARD)
    Extract         Lambda · sleep 2s
-   Identify        Lambda · sleep 2s · decide flags
-   ValidateDireto  Task  →  arn:aws:states:::aws-sdk:bedrockagentcore:invokeAgentRuntime
-                            (request-response: o SFN espera o agente ~15-25s e
-                             recebe o veredito DIRETO no resultado do step)
+   Identify        Lambda · sleep 2s · decides flags
+   ValidateDirect  Task  →  arn:aws:states:::aws-sdk:bedrockagentcore:invokeAgentRuntime
+                            (request-response: the SFN waits for the agent ~15-25s
+                             and receives the verdict DIRECTLY in the step result)
    ParseAgentResponse  (Pass: Response string → JSON)
-   ExtrairVeredito     (Pass: expõe $.validation)
+   ExtractVerdict      (Pass: exposes $.validation)
    PipelineCompleted
 ```
 
-- O agente roda em modo **síncrono** (sem `taskToken`): valida e **retorna o veredito no
-  próprio payload**. O mesmo runtime atende aos dois modos — ele decide pela presença ou não
-  do `taskToken` no evento.
-- **Sem Lambda, zero código de cola.** Mais simples de ler no Graph view.
+- The agent runs in **synchronous** mode (no `taskToken`): it validates and
+  **returns the verdict in the payload itself**. The same runtime serves both
+  modes — it decides based on the presence or absence of `taskToken` in the event.
+- **No Lambda, zero glue code.** Simpler to read in the Graph view.
 
-**Quando usar:** agente responde rápido (a chamada síncrona tem limite de ~15 min), pipeline
-simples, e você aceita pagar o tempo do *step* enquanto o agente responde.
+**When to use:** the agent responds quickly (the synchronous call has a ~15 min
+limit), the pipeline is simple, and you accept paying for the *step* time while
+the agent responds.
 
 ---
 
-## Lambda x Direto — comparação
+## Lambda vs Direct — comparison
 
-| | A — Lambda + waitForTaskToken | B — Direto (SDK integration) |
+| | A — Lambda + waitForTaskToken | B — Direct (SDK integration) |
 |---|---|---|
-| Lambda no caminho do agente | sim (dispatcher), mas **morre cedo** | **nenhuma** |
-| Modo do agente | assíncrono (callback) | síncrono (resposta no payload) |
-| Custo durante o processamento | **zero** (SFN dormindo) | paga o tempo do *step* (Standard cobra por transição, não por espera; o custo real é o AgentCore) |
-| Limite de duração | até 8h (agente) | ~15 min (chamada síncrona) |
-| Complexidade | maior (Lambda + IAM callback + token) | mínima (1 Task state) |
-| Lógica antes/depois do agente | explícita (`ValidateDispatch`/`ValidateResult`) | nos Pass states / outros steps |
+| Lambda in the agent path | yes (dispatcher), but **dies early** | **none** |
+| Agent mode | asynchronous (callback) | synchronous (response in payload) |
+| Cost during processing | **zero** (SFN sleeping) | pays for the *step* time (Standard bills per transition, not per wait; the real cost is AgentCore) |
+| Duration limit | up to 8h (agent) | ~15 min (synchronous call) |
+| Complexity | higher (Lambda + IAM callback + token) | minimal (1 Task state) |
+| Logic before/after the agent | explicit (`ValidateDispatch`/`ValidateResult`) | in the Pass states / other steps |
 
-> **Resumo:** para validações rápidas, **B (direto)** é mais simples. Para processos longos
-> ou multiagente, **A (Lambda + waitForTaskToken)** garante custo zero durante a espera.
+> **Summary:** for quick validations, **B (direct)** is simpler. For long-running
+> or multi-agent processes, **A (Lambda + waitForTaskToken)** guarantees zero
+> cost during the wait.
 
 ---
 
-## Como provar que a Lambda NÃO ficou bloqueada (estratégia A)
+## How to prove the Lambda was NOT blocked (strategy A)
 
-Este é o ponto central da demo.
+This is the central point of the demo.
 
-### Forma rápida — `evidencia-async.sh` (automatizado)
+### Quick way — `evidence-async.sh` (automated)
 
-Gera a evidência completa para uma execução, cruzando a duração do *state* com o
-`Billed Duration` da Lambda e os logs do agente:
+Generates the full evidence for one execution, cross-referencing the *state*
+duration with the Lambda `Billed Duration` and the agent logs:
 
 ```bash
-./evidencia-async.sh                  # usa a última execução do pipeline (Lambda)
-./evidencia-async.sh <executionArn>   # uma execução específica
+./evidence-async.sh                  # uses the latest execution of the pipeline (Lambda)
+./evidence-async.sh <executionArn>   # a specific execution
 ```
 
-Saída (exemplo real):
+Output (real example):
 
 ```
-1) STEP FUNCTIONS — estado ValidateDispatch (waitForTaskToken)
-   TaskSubmitted (retornou): 14:08:19   <- Lambda devolveu o controle
-   TaskSucceeded (callback): 14:08:34   <- AgentCore acordou o fluxo
-   >> DURACAO DO ESTADO     : 19.6s
-   >> ESPERA PELO AGENTE    : 14.7s
+1) STEP FUNCTIONS — ValidateDispatch state (waitForTaskToken)
+   TaskSubmitted (returned): 14:08:19   <- Lambda handed back control
+   TaskSucceeded (callback): 14:08:34   <- AgentCore woke up the flow
+   >> STATE DURATION        : 19.6s
+   >> WAIT FOR THE AGENT    : 14.7s
 
-2) LAMBDA — flow-credi-validate-dispatcher (CloudWatch REPORT)
-   >> BILLED DURATION       : 4.8s   (tempo que a Lambda REALMENTE viveu/foi cobrada)
+2) LAMBDA — doc-pipeline-validate-dispatcher (CloudWatch REPORT)
+   >> BILLED DURATION       : 4.8s   (time the Lambda ACTUALLY lived/was billed)
 
-VEREDITO
-   Estado durou ........ 19.6s
-   Lambda cobrada ...... 4.8s
-   Lambda OCIOSA evitada  14.9s (76%)
-   ✅ PROVADO: a Lambda NAO ficou bloqueada esperando o AgentCore.
+VERDICT
+   State lasted ........ 19.6s
+   Lambda billed ....... 4.8s
+   Lambda idle avoided   14.9s (76%)
+   ✅ PROVEN: the Lambda did NOT stay blocked waiting for AgentCore.
 
-3) RUNTIME AGENTCORE — "modo ASSINCRONO / background task" + "Acordando via SendTaskSuccess"
+3) AGENTCORE RUNTIME — "ASYNCHRONOUS mode / background task" + "Waking up via SendTaskSuccess"
 ```
 
-A lógica: se a Lambda ficasse parada esperando (anti-padrão `await`), o `Billed Duration`
-seria ~igual à duração do *state*. Como ela foi cobrada por **4,8s** mas o estado durou
-**19,6s**, fica provado que ela morreu e o agente processou os ~15s restantes sem nenhuma
-Lambda viva. (Numa execução da estratégia B, o script avisa que não há Lambda para "ficar
-parada".)
+The logic: if the Lambda sat there waiting (the `await` anti-pattern), the
+`Billed Duration` would be ~equal to the *state* duration. Since it was billed
+for **4.8s** but the state lasted **19.6s**, it is proven that it died and the
+agent processed the remaining ~15s with no Lambda alive. (For a strategy B
+execution, the script warns that there is no Lambda to "sit idle".)
 
-### Forma manual — os mesmos dados em 3 lugares
+### Manual way — the same data in 3 places
 
-### 1. Eventos do Step Functions (Event view / Table view)
+### 1. Step Functions events (Event view / Table view)
 
-No `ValidateDispatch`, o padrão `waitForTaskToken` gera **dois eventos separados**:
+In `ValidateDispatch`, the `waitForTaskToken` pattern generates **two separate
+events**:
 
 ```
-TaskStarted     ValidateDispatch   12:21:28   ← a Lambda começou
-TaskSubmitted   ValidateDispatch   12:21:33   ← a Lambda RETORNOU e MORREU (~5s)
-        (~20s de espera: agente trabalhando, NENHUMA Lambda viva)
-TaskSucceeded   ValidateDispatch   12:21:52   ← o agente acordou o fluxo (SendTaskSuccess)
+TaskStarted     ValidateDispatch   12:21:28   ← the Lambda started
+TaskSubmitted   ValidateDispatch   12:21:33   ← the Lambda RETURNED and DIED (~5s)
+        (~20s of wait: agent working, NO Lambda alive)
+TaskSucceeded   ValidateDispatch   12:21:52   ← the agent woke up the flow (SendTaskSuccess)
 ```
 
-- A presença do **`TaskSubmitted` separado do `TaskSucceeded`** é a **assinatura** do modo
-  assíncrono. Num invoke síncrono esse evento **não existe** (vai direto de `TaskStarted`
-  para `TaskSucceeded`).
-- O **gap entre `TaskSubmitted` e `TaskSucceeded`** (~20s) é o tempo em que o agente rodou
-  com a Lambda **já encerrada**.
+- The presence of **`TaskSubmitted` separate from `TaskSucceeded`** is the
+  **signature** of the async mode. In a synchronous invoke that event **does not
+  exist** (it goes straight from `TaskStarted` to `TaskSucceeded`).
+- The **gap between `TaskSubmitted` and `TaskSucceeded`** (~20s) is the time the
+  agent ran with the Lambda **already terminated**.
 
-### 2. Duração real da Lambda (CloudWatch / log REPORT)
+### 2. Real Lambda duration (CloudWatch / REPORT log)
 
 ```bash
 aws logs filter-log-events \
-  --log-group-name /aws/lambda/flow-credi-validate-dispatcher \
+  --log-group-name /aws/lambda/doc-pipeline-validate-dispatcher \
   --filter-pattern "REPORT" --region us-east-1
 ```
 
-O `Billed Duration` da `ValidateDispatch` é de **poucos segundos** (só o tempo de disparar o
-agente), **não** os ~15-25s do processamento. Compare com o tempo do *state* `ValidateDispatch`
-no Step Functions (muito maior) — a diferença é a espera sem Lambda.
+The `Billed Duration` of `ValidateDispatch` is **a few seconds** (only the time
+to fire the agent), **not** the ~15-25s of processing. Compare it with the
+`ValidateDispatch` *state* time in Step Functions (much larger) — the difference
+is the wait with no Lambda.
 
-### 3. Logs do runtime do AgentCore (a prova do lado do agente)
+### 3. AgentCore runtime logs (the proof from the agent side)
 
 ```bash
 aws logs filter-log-events \
@@ -181,139 +188,145 @@ aws logs filter-log-events \
   --region us-east-1
 ```
 
-Você verá, com timestamps que **casam** com o Step Functions:
-- `"Iniciando validacao (modo ASSINCRONO / background task)"` — logo após a Lambda morrer
-- `"Acordando Step Functions via SendTaskSuccess"` — bate com o `TaskSucceeded` (#)
+You will see, with timestamps that **match** Step Functions:
+- `"Starting validation (ASYNCHRONOUS mode / background task)"` — right after the Lambda dies
+- `"Waking up Step Functions via SendTaskSuccess"` — matches `TaskSucceeded` (#)
 
-> **Regra de bolso para a apresentação:** o *state* `ValidateDispatch` dura ~20-25s, mas o
-> `Billed Duration` da Lambda é ~5s. Essa diferença, visível lado a lado, é a economia.
+> **Rule of thumb for the presentation:** the `ValidateDispatch` *state* lasts
+> ~20-25s, but the Lambda `Billed Duration` is ~5s. That difference, visible side
+> by side, is the saving.
 
-Na **estratégia B (direto)** não há Lambda no caminho, então a questão "bloqueou ou não"
-nem se aplica — o que se paga é o tempo do *step* do Step Functions enquanto o AgentCore
-responde (visível na duração do estado `ValidateDireto`).
+For **strategy B (direct)** there is no Lambda in the path, so the "blocked or
+not" question does not even apply — what you pay for is the Step Functions
+*step* time while AgentCore responds (visible in the `ValidateDirect` state
+duration).
 
 ---
 
-## Estrutura do projeto
+## Project structure
 
-As Lambdas são **Node.js 22 (ESM)**; o agente do AgentCore é **Python**.
+The Lambdas are **Node.js 22 (ESM)**; the AgentCore agent is **Python**.
 
 ```
 template.yaml                       SAM: 2 state machines + Lambdas + IAM + X-Ray
 statemachine/
-  pipeline.asl.json                 estratégia A (Lambda + waitForTaskToken)
-  pipeline-direct.asl.json          estratégia B (AgentCore direto, SDK integration)
-functions/                          Lambdas em Node.js (index.mjs)
-  extract/                          OCR simulado (sleep 2s + logs)
-  identify/                         classifica o doc e decide flags (sleep 2s)
-  validate_dispatcher/              "ANTES" (estratégia A): invoca AgentCore e retorna na hora
+  pipeline.asl.json                 strategy A (Lambda + waitForTaskToken)
+  pipeline-direct.asl.json          strategy B (AgentCore direct, SDK integration)
+functions/                          Lambdas in Node.js (index.mjs)
+  extract/                          simulated OCR (sleep 2s + logs)
+  identify/                         classifies the doc and decides flags (sleep 2s)
+  validate_dispatcher/              "BEFORE" (strategy A): invokes AgentCore and returns immediately
                                     (@aws-sdk/client-bedrock-agentcore, bundled via esbuild)
-  validate_result/                  "DEPOIS" (estratégia A): processa o veredito
+  validate_result/                  "AFTER" (strategy A): processes the verdict
   organize/                         branch Organize / OrganizeSolo (sleep 2s)
-  validate/                         ValidateSolo (sleep 2s, sem agente)
-agentcore/                          Agente em Python (dual-mode: async + síncrono)
-  agent.py                          entrypoint + tool concluir_validacao
+  validate/                         ValidateSolo (sleep 2s, no agent)
+agentcore/                          Agent in Python (dual-mode: async + synchronous)
+  agent.py                          entrypoint + complete_validation tool
   Dockerfile  requirements.txt
-events/                             payloads de teste
-deploy.sh                           provisiona tudo (credencial + agente + SAM + callback)
-destroy.sh                          remove tudo (stack + runtime do AgentCore)
-run-demo.sh                         dispara execução e mostra timeline + resultado + trace
-evidencia-async.sh                  prova que a Lambda não bloqueou (state x Billed Duration)
+events/                             test payloads
+deploy.sh                           provisions everything (credentials + agent + SAM + callback)
+destroy.sh                          removes everything (stack + AgentCore runtime)
+run-demo.sh                         starts an execution and shows timeline + result + trace
+evidence-async.sh                   proves the Lambda did not block (state x Billed Duration)
 ```
 
-## Pré-requisitos
+## Prerequisites
 
-- AWS CLI, **AWS SAM CLI**, Docker, **Node.js 22** (Lambdas) e **Python 3.13** (agente)
+- AWS CLI, **AWS SAM CLI**, Docker, **Node.js 22** (Lambdas) and **Python 3.13** (agent)
 - **Bedrock AgentCore Starter Toolkit**: `pip install bedrock-agentcore-starter-toolkit`
-- Acesso ao modelo no Bedrock (ex.: Claude Sonnet) habilitado na conta/região
-- Região sugerida: `us-east-1`
+- Access to the model in Bedrock (e.g.: Claude Sonnet) enabled for the account/region
+- Suggested region: `us-east-1`
 
-## Deploy / Teardown automatizados (recomendado)
+## Automated deploy / teardown (recommended)
 
 ```bash
-./deploy.sh          # verifica credencial + ferramentas, deploya agente + SAM, anexa callback e testa
-./destroy.sh         # remove TUDO (desanexa policy, deleta stack, destroi o runtime do AgentCore)
+./deploy.sh          # checks credentials + tools, deploys agent + SAM, attaches callback and tests
+./destroy.sh         # removes EVERYTHING (detaches policy, deletes stack, destroys the AgentCore runtime)
 ```
 
-Flags úteis:
-- `./deploy.sh --skip-agent` — reusa o agente já deployado (só atualiza o stack SAM)
-- `./deploy.sh --no-test` — não roda a execução de validação no final
-- `./destroy.sh --yes` — não pede confirmação · `--keep-agent` — preserva o runtime
+Useful flags:
+- `./deploy.sh --skip-agent` — reuses the already-deployed agent (only updates the SAM stack)
+- `./deploy.sh --no-test` — does not run the validation execution at the end
+- `./destroy.sh --yes` — no confirmation prompt · `--keep-agent` — preserves the runtime
 
-O `deploy.sh` aborta cedo com mensagem clara se a **credencial AWS** estiver ausente/expirada
-ou se faltar alguma ferramenta (aws, sam, docker, node, python3, agentcore).
+`deploy.sh` aborts early with a clear message if the **AWS credentials** are
+missing/expired or if some tool is missing (aws, sam, docker, node, python3, agentcore).
 
-## Deploy — passo a passo (manual)
+## Deploy — step by step (manual)
 
-> ⚠️ Os comandos abaixo criam recursos na sua conta AWS. Rode numa conta sandbox/dev.
+> ⚠️ The commands below create resources in your AWS account. Run in a sandbox/dev account.
 
-### 1. Deployar o agente no AgentCore (gera o ARN do runtime)
+### 1. Deploy the agent to AgentCore (generates the runtime ARN)
 
 ```bash
 cd agentcore
-agentcore configure --entrypoint agent.py --name flowcredi
-agentcore deploy            # build do container, push ECR e criação do runtime
-# anote o Agent Runtime ARN no fim da saída
+agentcore configure --entrypoint agent.py --name docpipeline
+agentcore deploy            # container build, ECR push and runtime creation
+# note the Agent Runtime ARN at the end of the output
 cd ..
 ```
 
-### 2. Deployar as duas state machines (SAM), passando o ARN do agente
+### 2. Deploy the two state machines (SAM), passing the agent ARN
 
 ```bash
 sam build
 sam deploy --guided \
-  --parameter-overrides AgentRuntimeArn="arn:aws:bedrock-agentcore:us-east-1:ACCOUNT:runtime/flowcredi-XXXX"
+  --parameter-overrides AgentRuntimeArn="arn:aws:bedrock-agentcore:us-east-1:ACCOUNT:runtime/docpipeline-XXXX"
 ```
 
 Outputs:
-- `StateMachineArn` — estratégia A (Lambda + waitForTaskToken)
-- `StateMachineDirectArn` — estratégia B (AgentCore direto)
-- `AgentCallbackPolicyArn` — **anexe à execution role do AgentCore** (necessário só p/ a
-  estratégia A, onde o agente chama `SendTaskSuccess`).
+- `StateMachineArn` — strategy A (Lambda + waitForTaskToken)
+- `StateMachineDirectArn` — strategy B (AgentCore direct)
+- `AgentCallbackPolicyArn` — **attach it to the AgentCore execution role** (needed
+  only for strategy A, where the agent calls `SendTaskSuccess`).
 
-### 3. Conectar o callback (uma vez — necessário para a estratégia A)
+### 3. Connect the callback (once — needed for strategy A)
 
 ```bash
 aws iam attach-role-policy \
-  --role-name <ROLE_DO_AGENTCORE_RUNTIME> \
-  --policy-arn <AgentCallbackPolicyArn-do-output>
+  --role-name <AGENTCORE_RUNTIME_ROLE> \
+  --policy-arn <AgentCallbackPolicyArn-from-output>
 ```
 
-## Rodar a demo
+## Run the demo
 
 ```bash
-./run-demo.sh            # estratégia A (Lambda + waitForTaskToken) — default
-./run-demo.sh --direct   # estratégia B (AgentCore direto, sem Lambda)
-./run-demo.sh --lambda   # idem A, explícito
+./run-demo.sh            # strategy A (Lambda + waitForTaskToken) — default
+./run-demo.sh --direct   # strategy B (AgentCore direct, no Lambda)
+./run-demo.sh --lambda   # same as A, explicit
 ```
 
-O script dispara a execução, acompanha até o fim e imprime: a **timeline dos estados com
-duração**, o **veredito do agente** (`source: agentcore`) e o **trace ID do X-Ray**.
+The script starts the execution, follows it to the end and prints: the
+**states timeline with durations**, the **agent verdict** (`source: agentcore`)
+and the **X-Ray trace ID**.
 
-## Observabilidade
+## Observability
 
-- **X-Ray**: ativo nas Lambdas (`Tracing: Active`) e nas state machines (`Tracing.Enabled`).
-  No **Service Map**/waterfall dá para ver o nó do AgentCore e o tempo de espera.
-- **Logs estruturados**: cada Lambda Node.js emite JSON (`console.log`) com início/fim e duração.
-- **Step Functions logs**: `ALL` em `/aws/vendedlogs/states/flow-credi-document-pipeline`
-  e `/aws/vendedlogs/states/flow-credi-pipeline-direct`.
-- **AgentCore**: logs em `/aws/bedrock-agentcore/runtimes/*`.
+- **X-Ray**: enabled on the Lambdas (`Tracing: Active`) and on the state machines
+  (`Tracing.Enabled`). In the **Service Map**/waterfall you can see the AgentCore
+  node and the wait time.
+- **Structured logs**: each Node.js Lambda emits JSON (`console.log`) with start/end and duration.
+- **Step Functions logs**: `ALL` in `/aws/vendedlogs/states/doc-pipeline`
+  and `/aws/vendedlogs/states/doc-pipeline-direct`.
+- **AgentCore**: logs in `/aws/bedrock-agentcore/runtimes/*`.
 
-> Nota: a conta está com **X-Ray Transaction Search** (destino CloudWatch Logs). Os traces
-> ficam em `aws/spans`; a busca por trace ID depende do sampling (subido para 100% durante a
-> demo). Veja o waterfall na seção **Spans** da página do trace.
+> Note: the account has **X-Ray Transaction Search** enabled (destination
+> CloudWatch Logs). Traces are stored in `aws/spans`; searching by trace ID
+> depends on sampling (raised to 100% during the demo). See the waterfall in the
+> **Spans** section of the trace page.
 
-## Notas de design
+## Design notes
 
-- **Por que a estratégia A usa `lambda:invoke.waitForTaskToken` e não chama o AgentCore
-  direto?** É a forma de obter **custo zero durante a espera** e suportar processos longos
-  (até 8h). O Step Functions também tem integração direta (estratégia B), porém síncrona
-  (~15 min) — por isso mantemos as duas para comparar.
-- **`TimeoutSeconds`/`HeartbeatSeconds`** no `ValidateDispatch` evitam execução presa caso o
-  agente nunca chame o callback.
-- **Agente dual-mode:** o mesmo `agent.py` atende às duas state machines — com `taskToken`
-  roda assíncrono (callback); sem `taskToken` roda síncrono (veredito no payload).
-- **Roteamento da demo:** o documento de exemplo contém "CONTRATO/MATRICULA/FINANCIAMENTO",
-  então o Identify marca `shouldOrganize=true` E `shouldValidate=true` e a estratégia A segue
-  pelo `OrganizeAndValidateParallel` (Validate ao lado do Organize).
-```
+- **Why does strategy A use `lambda:invoke.waitForTaskToken` and not call
+  AgentCore directly?** It is the way to get **zero cost during the wait** and to
+  support long-running processes (up to 8h). Step Functions also has a direct
+  integration (strategy B), but synchronous (~15 min) — that is why we keep both
+  to compare.
+- **`TimeoutSeconds`/`HeartbeatSeconds`** on `ValidateDispatch` prevent a stuck
+  execution if the agent never calls the callback.
+- **Dual-mode agent:** the same `agent.py` serves both state machines — with a
+  `taskToken` it runs asynchronously (callback); without a `taskToken` it runs
+  synchronously (verdict in the payload).
+- **Demo routing:** the example document contains "CONTRACT/REGISTRATION/FINANCING",
+  so Identify sets `shouldOrganize=true` AND `shouldValidate=true` and strategy A
+  goes through `OrganizeAndValidateParallel` (Validate next to Organize).

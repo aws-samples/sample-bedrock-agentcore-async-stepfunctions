@@ -1,19 +1,21 @@
-"""Agente do Bedrock AgentCore — etapa Validate do pipeline.
+"""Bedrock AgentCore agent — Validate step of the pipeline.
 
-Suporta DOIS modos de invocacao:
+Supports TWO invocation modes:
 
-  A) ASSINCRONO (com taskToken) — usado pela state machine `flow-credi-document-
-     pipeline`, via Lambda dispatcher + `lambda:invoke.waitForTaskToken`.
-     O entrypoint dispara o trabalho em background (`@app.async_task`), retorna
-     "accepted" na hora e, ao terminar (~15s), chama `SendTaskSuccess(taskToken)`.
+  A) ASYNCHRONOUS (with taskToken) — used by the `doc-pipeline` state machine,
+     via a Lambda dispatcher + `lambda:invoke.waitForTaskToken`. The entrypoint
+     kicks off the work in the background (`@app.async_task`), returns
+     "accepted" immediately and, once it finishes (~15s), calls
+     `SendTaskSuccess(taskToken)`.
 
-  B) SINCRONO (sem taskToken) — usado pela state machine
-     `flow-credi-pipeline-direct`, que chama o Runtime DIRETO via SDK integration
-     (`states:::aws-sdk:bedrockagentcore:invokeAgentRuntime`), SEM Lambda.
-     Aqui o entrypoint roda a validacao e RETORNA o veredito no proprio payload.
+  B) SYNCHRONOUS (without taskToken) — used by the `doc-pipeline-direct` state
+     machine, which invokes the Runtime DIRECTLY via SDK integration
+     (`states:::aws-sdk:bedrockagentcore:invokeAgentRuntime`), with NO Lambda.
+     Here the entrypoint runs the validation and RETURNS the verdict in the
+     response payload itself.
 
-Observabilidade: o AgentCore Runtime exporta traces para X-Ray/CloudWatch quando
-a execution role tem permissao. Logs em /aws/bedrock-agentcore/runtimes/*.
+Observability: the AgentCore Runtime exports traces to X-Ray/CloudWatch when
+the execution role has permission. Logs in /aws/bedrock-agentcore/runtimes/*.
 """
 
 import asyncio
@@ -27,83 +29,84 @@ from bedrock_agentcore import BedrockAgentCoreApp
 from strands import Agent, tool
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
-logger = logging.getLogger("flow-credi-agent")
+logger = logging.getLogger("doc-pipeline-agent")
 
 app = BedrockAgentCoreApp()
 sfn = boto3.client("stepfunctions")
 
 MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-6")
 
-# Guarda o veredito produzido pela tool durante a invocacao corrente.
-_current = {"taskToken": None, "executionId": None, "veredito": None}
+# Holds the verdict produced by the tool during the current invocation.
+_current = {"taskToken": None, "executionId": None, "verdict": None}
 
 
 @tool
-def concluir_validacao(aprovado: bool, problemas: list, resumo: str) -> str:
-    """Registra o veredito da validacao do documento.
+def complete_validation(approved: bool, issues: list, summary: str) -> str:
+    """Record the document validation verdict.
 
-    Use esta ferramenta UMA vez, ao final da validacao, para concluir a etapa.
-    No modo assincrono ela tambem acorda o Step Functions (SendTaskSuccess); no
-    modo sincrono o veredito e devolvido no payload de resposta.
+    Use this tool ONCE, at the end of the validation, to conclude the step.
+    In async mode it also wakes up Step Functions (SendTaskSuccess); in sync
+    mode the verdict is returned in the response payload.
 
     Args:
-        aprovado: True se o documento passou na validacao do banco.
-        problemas: Lista de problemas/inconsistencias encontrados (vazia se ok).
-        resumo: Resumo curto do resultado da validacao.
+        approved: True if the document passed the bank's validation.
+        issues: List of problems/inconsistencies found (empty if OK).
+        summary: Short summary of the validation result.
     """
-    veredito = {
-        "aprovado": aprovado,
-        "problemas": problemas,
-        "resumo": resumo,
+    verdict = {
+        "approved": approved,
+        "issues": issues,
+        "summary": summary,
         "source": "agentcore",
     }
-    _current["veredito"] = veredito
+    _current["verdict"] = verdict
 
     task_token = _current["taskToken"]
     if task_token:
-        logger.info("Acordando Step Functions via SendTaskSuccess: %s", veredito)
-        sfn.send_task_success(taskToken=task_token, output=json.dumps(veredito))
-        return "Step Functions acordado com sucesso."
+        logger.info("Waking up Step Functions via SendTaskSuccess: %s", verdict)
+        sfn.send_task_success(taskToken=task_token, output=json.dumps(verdict))
+        return "Step Functions woken up successfully."
 
-    logger.info("Veredito registrado (modo sincrono): %s", veredito)
-    return "Veredito registrado."
+    logger.info("Verdict recorded (sync mode): %s", verdict)
+    return "Verdict recorded."
 
 
 def _build_agent() -> Agent:
     return Agent(
         model=MODEL_ID,
-        tools=[concluir_validacao],
+        tools=[complete_validation],
         system_prompt=(
-            "Voce e um analista de validacao de documentos de financiamento "
-            "imobiliario de um banco. Verifique se o documento esta completo e "
-            "consistente (matricula, contrato, dados das partes, valores). "
-            "Pense com calma e, ao concluir, OBRIGATORIAMENTE chame a ferramenta "
-            "'concluir_validacao' com o veredito (aprovado, problemas, resumo)."
+            "You are a document validation analyst for a bank's real estate "
+            "financing process. Check whether the document is complete and "
+            "consistent (property registration, contract, party details, "
+            "amounts). Think it through and, once finished, you MUST call the "
+            "'complete_validation' tool with the verdict (approved, issues, "
+            "summary)."
         ),
     )
 
 
-def _mensagem(prompt: str, document: dict, extracted_text: str) -> str:
+def _message(prompt: str, document: dict, extracted_text: str) -> str:
     return (
-        f"{prompt}\n\nDocumento: {json.dumps(document, ensure_ascii=False)}\n"
-        f"Texto extraido:\n{extracted_text}"
+        f"{prompt}\n\nDocument: {json.dumps(document, ensure_ascii=False)}\n"
+        f"Extracted text:\n{extracted_text}"
     )
 
 
 @app.async_task
-async def validar_documento_async(prompt: str, document: dict, extracted_text: str):
-    """Modo A — trabalho de fundo: valida (~15s) e a tool chama o callback."""
-    inicio = time.time()
-    logger.info("Iniciando validacao (modo ASSINCRONO / background task)")
+async def validate_document_async(prompt: str, document: dict, extracted_text: str):
+    """Mode A — background work: validates (~15s) and the tool calls the callback."""
+    start = time.time()
+    logger.info("Starting validation (ASYNCHRONOUS mode / background task)")
     agent = _build_agent()
     try:
-        await agent.invoke_async(_mensagem(prompt, document, extracted_text))
-        decorrido = time.time() - inicio
-        if decorrido < 15:
-            await asyncio.sleep(15 - decorrido)
-        logger.info("Validacao assincrona concluida em %.1fs", time.time() - inicio)
-    except Exception as exc:  # noqa: BLE001 — falha vira SendTaskFailure
-        logger.exception("Falha na validacao; sinalizando SendTaskFailure")
+        await agent.invoke_async(_message(prompt, document, extracted_text))
+        elapsed = time.time() - start
+        if elapsed < 15:
+            await asyncio.sleep(15 - elapsed)
+        logger.info("Async validation finished in %.1fs", time.time() - start)
+    except Exception as exc:  # noqa: BLE001 — failure becomes SendTaskFailure
+        logger.exception("Validation failed; signaling SendTaskFailure")
         if _current["taskToken"]:
             sfn.send_task_failure(
                 taskToken=_current["taskToken"],
@@ -114,35 +117,35 @@ async def validar_documento_async(prompt: str, document: dict, extracted_text: s
 
 @app.entrypoint
 async def handler(event):
-    """Decide o modo pela presenca de taskToken."""
-    logger.info("Invocacao recebida pelo AgentCore")
+    """Decide the mode based on the presence of taskToken."""
+    logger.info("Invocation received by AgentCore")
 
     _current["taskToken"] = event.get("taskToken")
     _current["executionId"] = event.get("executionId")
-    _current["veredito"] = None
-    prompt = event.get("prompt", "Valide o documento.")
+    _current["verdict"] = None
+    prompt = event.get("prompt", "Validate the document.")
     document = event.get("document", {})
     extracted_text = event.get("extractedText", "")
 
-    # ----- Modo A: ASSINCRONO (com taskToken) -----
+    # ----- Mode A: ASYNCHRONOUS (with taskToken) -----
     if _current["taskToken"]:
-        asyncio.create_task(validar_documento_async(prompt, document, extracted_text))
-        return {"status": "accepted", "message": "Validacao iniciada em background."}
+        asyncio.create_task(validate_document_async(prompt, document, extracted_text))
+        return {"status": "accepted", "message": "Validation started in background."}
 
-    # ----- Modo B: SINCRONO (sem taskToken) — chamada direta do Step Functions -----
-    inicio = time.time()
-    logger.info("Iniciando validacao (modo SINCRONO / chamada direta do SFN)")
+    # ----- Mode B: SYNCHRONOUS (no taskToken) — direct call from Step Functions -----
+    start = time.time()
+    logger.info("Starting validation (SYNCHRONOUS mode / direct call from SFN)")
     agent = _build_agent()
-    await agent.invoke_async(_mensagem(prompt, document, extracted_text))
-    veredito = _current["veredito"] or {
-        "aprovado": False,
-        "problemas": ["Agente nao chamou concluir_validacao"],
-        "resumo": "Veredito ausente.",
+    await agent.invoke_async(_message(prompt, document, extracted_text))
+    verdict = _current["verdict"] or {
+        "approved": False,
+        "issues": ["Agent did not call complete_validation"],
+        "summary": "Verdict missing.",
         "source": "agentcore",
     }
-    logger.info("Validacao sincrona concluida em %.1fs", time.time() - inicio)
-    # Retorna o veredito no proprio payload — o SFN recebe direto no output do step.
-    return {"validation": veredito}
+    logger.info("Sync validation finished in %.1fs", time.time() - start)
+    # Return the verdict in the payload itself — the SFN receives it directly in the step output.
+    return {"validation": verdict}
 
 
 if __name__ == "__main__":

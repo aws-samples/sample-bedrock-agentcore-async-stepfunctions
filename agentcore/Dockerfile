@@ -1,5 +1,5 @@
-# Container do Bedrock AgentCore Runtime.
-# AgentCore exige imagem linux/arm64 expondo a porta 8080.
+# Bedrock AgentCore Runtime container.
+# AgentCore requires a linux/arm64 image exposing port 8080.
 FROM --platform=linux/arm64 public.ecr.aws/docker/library/python:3.13-slim
 
 WORKDIR /app
@@ -9,9 +9,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY agent.py .
 
-# Porta padrao do contrato do AgentCore Runtime
+# Default port of the AgentCore Runtime contract
 EXPOSE 8080
 
-# Observabilidade: instrumentacao OTEL/X-Ray pode ser ligada via ADOT.
-# Para a PoC, o AgentCore ja entrega traces basicos quando a role tem permissao.
+# Observability: OTEL/X-Ray instrumentation can be enabled via ADOT.
+# For this sample, AgentCore already emits basic traces when the role has permission.
 CMD ["python", "agent.py"]

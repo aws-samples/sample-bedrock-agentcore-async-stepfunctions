@@ -1,25 +1,26 @@
 #!/usr/bin/env bash
 #
-# run-demo.sh — dispara uma nova execucao do pipeline flow-credi e acompanha
-# ate o fim, imprimindo a timeline (com o gap assincrono do AgentCore), o
-# resultado do agente e o trace ID do X-Ray.
+# run-demo.sh — starts a new execution of the document pipeline and follows it
+# to the end, printing the timeline (with the AgentCore async gap), the agent
+# result and the X-Ray trace ID.
 #
-# Uso:
-#   ./run-demo.sh                 # roda e acompanha
-#   ./run-demo.sh --no-wait       # so dispara e sai (nao espera terminar)
+# Usage:
+#   ./run-demo.sh                 # runs and follows
+#   ./run-demo.sh --no-wait       # only starts and exits (does not wait for completion)
 #
 set -euo pipefail
 
-# Regiao onde o stack esta deployado. Forcamos us-east-1 (ignora AWS_REGION do
-# ambiente, que pode apontar para outra regiao). Ajuste aqui se mudar de regiao.
+# Region where the stack is deployed. We force us-east-1 (ignoring AWS_REGION
+# from the environment, which may point to another region). Adjust here if you
+# change region.
 export AWS_REGION="us-east-1"
 export AWS_DEFAULT_REGION="$AWS_REGION"
 
-STACK="flow-credi-poc"
+STACK="doc-pipeline"
 INPUT_FILE="$(dirname "$0")/events/start-execution.json"
 WAIT=true
-# Qual pipeline rodar: "lambda" (default, waitForTaskToken + Lambda) ou
-# "direct" (AgentCore chamado direto do Step Functions, sem Lambda).
+# Which pipeline to run: "lambda" (default, waitForTaskToken + Lambda) or
+# "direct" (AgentCore called directly from Step Functions, no Lambda).
 PIPELINE="lambda"
 OUTPUT_KEY="StateMachineArn"
 for arg in "$@"; do
@@ -31,31 +32,31 @@ for arg in "$@"; do
 done
 echo "Pipeline: $PIPELINE"
 
-# --- descobre o ARN da state machine pelo output do stack -------------------
+# --- discover the state machine ARN from the stack output -------------------
 SM_ARN=$(aws cloudformation describe-stacks --stack-name "$STACK" \
   --query "Stacks[0].Outputs[?OutputKey=='$OUTPUT_KEY'].OutputValue" \
   --output text 2>/dev/null || true)
 
 if [[ -z "$SM_ARN" || "$SM_ARN" == "None" ]]; then
-  echo "ERRO: nao achei a StateMachineArn no stack '$STACK' em $AWS_REGION." >&2
-  echo "      O stack esta deployado? (sam deploy)" >&2
+  echo "ERROR: could not find StateMachineArn in stack '$STACK' in $AWS_REGION." >&2
+  echo "       Is the stack deployed? (sam deploy)" >&2
   exit 1
 fi
 
 NAME="demo-$(date +%Y%m%d-%H%M%S)"
 echo "State machine : $SM_ARN"
-echo "Execucao      : $NAME"
+echo "Execution     : $NAME"
 echo "Input         : $INPUT_FILE"
 echo
 
-# --- dispara ----------------------------------------------------------------
+# --- start ------------------------------------------------------------------
 EXEC_ARN=$(aws stepfunctions start-execution \
   --state-machine-arn "$SM_ARN" \
   --name "$NAME" \
   --input "file://$INPUT_FILE" \
   --query executionArn --output text)
 
-echo "Execucao iniciada:"
+echo "Execution started:"
 echo "  $EXEC_ARN"
 echo
 echo "Console (Step Functions):"
@@ -66,8 +67,8 @@ if [[ "$WAIT" == "false" ]]; then
   exit 0
 fi
 
-# --- acompanha ate terminar -------------------------------------------------
-echo -n "Aguardando conclusao"
+# --- follow until completion ------------------------------------------------
+echo -n "Waiting for completion"
 STATUS="RUNNING"
 for _ in $(seq 1 40); do
   STATUS=$(aws stepfunctions describe-execution --execution-arn "$EXEC_ARN" \
@@ -77,21 +78,21 @@ for _ in $(seq 1 40); do
   sleep 3
 done
 echo
-echo "Status final: $STATUS"
+echo "Final status: $STATUS"
 echo
 
-# --- timeline dos estados (tempo de cada um) --------------------------------
-echo "=== Timeline (estados x duracao) ==="
+# --- states timeline (duration of each) -------------------------------------
+echo "=== Timeline (states x duration) ==="
 aws stepfunctions get-execution-history --execution-arn "$EXEC_ARN" --output json \
-  > /tmp/flowcredi_hist.json
+  > /tmp/docpipeline_hist.json
 python3 - << 'PY'
 import json
 from datetime import datetime
-h = json.load(open('/tmp/flowcredi_hist.json'))
+h = json.load(open('/tmp/docpipeline_hist.json'))
 
 def ts(ev): return datetime.fromisoformat(ev['timestamp'].replace('Z','+00:00'))
 
-# tempo de entrada/saida por estado
+# enter/exit time per state
 enter, exit_ = {}, {}
 order = []
 for ev in h['events']:
@@ -107,24 +108,24 @@ if order:
     for nm in order:
         ini = (enter[nm]-t0).total_seconds()
         dur = (exit_.get(nm, enter[nm])-enter[nm]).total_seconds()
-        marca = ''
-        if nm in ('ValidateDispatch','ValidateDireto'):
-            marca = '  <<< chamada ao AgentCore'
-        print(f"  +{ini:5.1f}s  dur {dur:5.1f}s  {nm}{marca}")
+        mark = ''
+        if nm in ('ValidateDispatch','ValidateDirect'):
+            mark = '  <<< call to AgentCore'
+        print(f"  +{ini:5.1f}s  dur {dur:5.1f}s  {nm}{mark}")
 PY
 echo
 
-# --- resultado do agente ----------------------------------------------------
-echo "=== Resultado devolvido pelo AgentCore (validation) ==="
+# --- agent result -----------------------------------------------------------
+echo "=== Result returned by AgentCore (validation) ==="
 aws stepfunctions describe-execution --execution-arn "$EXEC_ARN" \
-  --query output --output text > /tmp/flowcredi_out.json 2>/dev/null || true
+  --query output --output text > /tmp/docpipeline_out.json 2>/dev/null || true
 python3 - << 'PY'
 import json
 try:
-    o = json.load(open('/tmp/flowcredi_out.json'))
+    o = json.load(open('/tmp/docpipeline_out.json'))
 except Exception:
-    print("  (sem output — execucao pode ter falhado)"); raise SystemExit
-# output do Parallel e uma lista de branches; procura o que tem validation
+    print("  (no output — the execution may have failed)"); raise SystemExit
+# the Parallel output is a list of branches; look for the one that has validation
 val = None
 def find_val(x):
     global val
@@ -136,18 +137,18 @@ def find_val(x):
 find_val(o)
 if val:
     print("  source  :", val.get('source'))
-    print("  aprovado:", val.get('aprovado'))
-    print("  resumo  :", val.get('resumo'))
+    print("  approved:", val.get('approved'))
+    print("  summary :", val.get('summary'))
 else:
-    print("  (validation nao encontrado no output)")
+    print("  (validation not found in the output)")
 PY
 echo
 
-# --- trace X-Ray ------------------------------------------------------------
-echo "=== Trace X-Ray ==="
+# --- X-Ray trace ------------------------------------------------------------
+echo "=== X-Ray trace ==="
 START=$(date -v-3M +%s 2>/dev/null || date -d '3 minutes ago' +%s)
 NOWS=$(date +%s)
 aws xray get-trace-summaries --start-time "$START" --end-time "$NOWS" \
   --query "reverse(sort_by(TraceSummaries,&Duration))[0].Id" --output text 2>/dev/null \
-  | sed 's/^/  Trace ID: /' || echo "  (trace ainda indexando — tente em ~1 min)"
+  | sed 's/^/  Trace ID: /' || echo "  (trace still indexing — try again in ~1 min)"
 echo "  Console (Traces): https://$AWS_REGION.console.aws.amazon.com/cloudwatch/home?region=$AWS_REGION#xray:traces/query"

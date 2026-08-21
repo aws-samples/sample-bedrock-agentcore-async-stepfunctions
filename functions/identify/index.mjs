@@ -1,41 +1,41 @@
-// Etapa Identify do pipeline (Lambda sincrona simples).
-// Classifica o tipo do documento e decide as flags de roteamento
-// (shouldOrganize / shouldValidate). NAO chama o agente. Simula ~2s.
+// Identify step of the pipeline (simple synchronous Lambda).
+// Classifies the document type and decides the routing flags
+// (shouldOrganize / shouldValidate). Does NOT call the agent. Simulates ~2s.
 
 const SLEEP_SECONDS = Number(process.env.SIMULATED_WORK_SECONDS ?? "2");
 const sleep = (s) => new Promise((r) => setTimeout(r, s * 1000));
 
 const log = (level, message, extra = {}) =>
-  console.log(JSON.stringify({ level, message, service: "flow-credi-poc", ...extra }));
+  console.log(JSON.stringify({ level, message, service: "doc-pipeline", ...extra }));
 
-function classificar(document, extractedText) {
-  const texto = (extractedText ?? "").toUpperCase();
+function classify(document, extractedText) {
+  const text = (extractedText ?? "").toUpperCase();
 
-  // Regra de demo: documentos de financiamento/contrato precisam de organizacao
-  // E validacao -> entram no caminho Parallel (Organize + Validate lado a lado),
-  // onde o branch Validate chama o agente (AgentCore).
-  const ehFinanciamento = ["CONTRATO", "MATRICULA", "FINANCIAMENTO"].some((t) =>
-    texto.includes(t)
+  // Demo rule: financing/contract documents need both organization
+  // AND validation -> they take the Parallel path (Organize + Validate side by
+  // side), where the Validate branch calls the agent (AgentCore).
+  const isFinancing = ["CONTRACT", "REGISTRATION", "FINANCING"].some((t) =>
+    text.includes(t)
   );
 
   const result = {
-    tipo: document.tipo ?? "desconhecido",
-    shouldOrganize: ehFinanciamento,
-    shouldValidate: ehFinanciamento,
+    type: document.type ?? "unknown",
+    shouldOrganize: isFinancing,
+    shouldValidate: isFinancing,
   };
-  log("INFO", "Documento classificado", result);
+  log("INFO", "Document classified", result);
   return result;
 }
 
 export const handler = async (event) => {
-  log("INFO", "Identify iniciado", { event });
+  log("INFO", "Identify started", { event });
 
   const document = event.document ?? {};
   const extractedText = event.extract?.extractedText ?? "";
 
   await sleep(SLEEP_SECONDS);
-  const identify = classificar(document, extractedText);
+  const identify = classify(document, extractedText);
 
-  log("INFO", "Identify concluido", { duracao_s: SLEEP_SECONDS });
+  log("INFO", "Identify finished", { duration_s: SLEEP_SECONDS });
   return { ...event, identify };
 };
