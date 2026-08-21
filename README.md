@@ -1,5 +1,8 @@
 # Document Pipeline with Bedrock AgentCore
 
+> This code accompanies the AWS blog post
+> [Asynchronous patterns for calling Amazon Bedrock AgentCore agents in serverless pipelines](https://aws.amazon.com/blogs/machine-learning/asynchronous-patterns-for-calling-amazon-bedrock-agentcore-agents-in-serverless-pipelines/).
+
 > **Goal of the demo:** validate real estate financing documents with a
 > **Bedrock AgentCore** agent (~15s of processing) inside a **Step Functions**
 > pipeline, showing how to **not waste Lambda cost** while the agent works.
